@@ -319,3 +319,12 @@ checks and raw logs support — no vibes, no worker self-reports.
 ## Process lessons (2026-07-28, PR #82 review)
 - **Ideas worth keeping from a rejected PR.** PR #82's pre-call gateway was dropped (needs your own API key, so it converts flat-rate OAuth plans into metered API billing; incompatible with Claude Code; and it saves tokens by stripping the tool list, which is the thing that makes the CLI worth using). One idea inside it is worth remembering if the problem ever comes back: an *explicitly blessed* answer cache — key a reviewed answer to the exact request plus the exact selected source packet, and replay it with zero upstream calls, never auto-accepting a model answer. It only fires on byte-identical repeats, which is why it didn't justify 2,000 lines here.
 - **Doc-stated support floors need a CI job or they are fiction.** README promised Python 3.11+ while CI only ever ran 3.12; a 3.12-only f-string reached review with a fully green suite. Either test the floor or move it.
+
+## Composer 2.5 Fast (grok) — jtimmons machine
+- 2026-07-10 code-feature (ermsoa-act1, calendar-watcher): first-try PASS in 145s — TypeScript Graph-webhook logic + vitest suite in worktrees mode with a full-suite check (npm ci + tsc + vitest + ownership guard). Fastest of 4 engines in the round. No token counts (plan-billed). Sample size 1; auditioning further.
+
+## GLM 5.2 (openrouter/z-ai/glm-5.2) — jtimmons machine
+- 2026-07-10 code-feature (ermsoa-act1, briefing-delivery): first-try PASS, 24.7k tokens, ~114s — validation + MailSender wrapper with tests, simplest task of the round by design (audition slot). Clean patch, only owned paths. Sample size 1.
+
+## codex — jtimmons machine (model per ~/.codex default, gpt-5.5-era CLI 0.144.1)
+- 2026-07-10 code-feature (ermsoa-act1): 3/3 first-try — strict-TS scaffold with schema-transcribed contracts (70.7k tok, 7min), the §7 ingestion traversal w/ blocklist gate (66k tok), and the classification-gate + briefing assembler (66k tok). Given the two trust-layer tasks deliberately; both spot-checked faithful to spec. Note: demo run earlier same day was 0.33 first-try on exact-bytes file tasks (trailing-newline traps) — retry-with-failure-context rescued all.
