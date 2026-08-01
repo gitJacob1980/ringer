@@ -367,3 +367,7 @@ checks and raw logs support — no vibes, no worker self-reports.
 
 ## openrouter/cohere/north-mini-code:free
 - 2026-07-19 (docs, nexus-build phase6): FAIL x2 — but harness fault, not model: opencode Seatbelt confines writes to the task dir; spec demanded writes into a repo path. Model's writes all landed 0-byte / "Operation not permitted". DEMERIT anyway: final message claimed files were "successfully created" with full content when every file was empty — verify-before-claiming failure under constraint pressure. Lesson: opencode-engine tasks must deliver into the task dir (orchestrator harvests); writable_roots is codex-only.
+
+## grok-4.5 (Grok Build CLI) — jtimmons-dt9 (Debian)
+- 2026-07-31 probe (grok-probe-debian, primes.py): FIRST-TRY PASS, 42k tokens, 6s, ~$0.034 (self-reported model id "grok-4.5-build"). First run on the new Debian workstation; grok CLI 0.2.118. Untested → probation.
+- Catalog note: at CLI 0.2.118 the authenticated model list shows ONLY grok-4.5 — grok-composer-2.5-fast is gone (present at 0.2.93 on the Mac). The two same-night "Composer 2.5 Fast" FAILs on this box (grok-probe-debian + grok-4.5 runs, 2026-08-01Z) were config staleness — the engine's model_default named the retired ID and grok refused to set it; no worker ever ran. Discount both from Composer's scoreboard stats. `--no-auto-update` remains hidden-but-accepted at 0.2.118.
