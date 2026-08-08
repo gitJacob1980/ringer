@@ -17,6 +17,14 @@ checks and raw logs support — no vibes, no worker self-reports.
 - Strongest general worker; the default engine. Spend reasoning effort per
   task via `engine_args` (`["-c", "model_reasoning_effort=low|medium|high"]`)
   — high on gnarly tasks, low on boilerplate.
+- 2026-08-08 — code-feature (docfoundry review rounds 3–7, 6 runs incl.
+  two polish rounds): 6/6 first-try, 65k–226k tokens/task. Its sandbox
+  DENIES binding 127.0.0.1 even port 0 — socket-bound pytest suites fail
+  inside the worker with PermissionError; codex handled it well both
+  times (reported honestly in notes.md, self-verified via in-process
+  HTTP shim / no-socket harness) and the executed check outside the
+  sandbox stayed the truth. Spec the full-suite command anyway; don't
+  read a worker's in-sandbox "N failed (socket bind)" as a red flag.
 - 2026-08-08 — code-feature (docfoundry ocr): pass on attempt 2, ~107k
   tokens. Second confirmed case of codex resolving an ownership-grep
   failure DESTRUCTIVELY: the check flagged the orchestrator's own
@@ -314,6 +322,7 @@ checks and raw logs support — no vibes, no worker self-reports.
 - Same day, different session (bench-harness-patches, code-fix): 0.29 first-try over 7 tasks on a Next.js/Turbopack harness. Spec and check quality dominate model choice — see the scoreboard before generalizing either number.
 
 ## GPT-5.5 (codex) — attribution caveat
+- 2026-08-08 code-fix (claude-memory retire-monolith, worktree, high reasoning): PASS on attempt 2 of a wide 14-file refactor with a 300+-test executed check; attempt-1 failure was a check grep hitting a docstring mention, not a code defect — retry-with-check-output fixed it precisely. ~175k tokens total. Note: worker sandbox had no network, so it could not run `uvx pytest` itself; the executed check (outside the sandbox) carried verification. Spec the runner's availability next time or vendor pytest.
 - Scoreboard rows dated before 2026-07-09 may actually be gpt-5.6: codex eval rows logged model="" until the write-time stamping fix (PR #18) and were credited to GPT-5.5 by the registry default at read time, while the machine's codex default had already moved to gpt-5.6-sol at an unknown earlier date. `scripts/backfill_model_from_logs.py` re-stamps rows with surviving command-log evidence; anything it skips is a mixed-model aggregate. Trust post-2026-07-09 rows.
 
 ## nvidia/nemotron-3-super-120b-a12b:free
