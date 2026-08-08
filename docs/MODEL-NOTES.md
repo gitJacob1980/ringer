@@ -17,6 +17,14 @@ checks and raw logs support — no vibes, no worker self-reports.
 - Strongest general worker; the default engine. Spend reasoning effort per
   task via `engine_args` (`["-c", "model_reasoning_effort=low|medium|high"]`)
   — high on gnarly tasks, low on boilerplate.
+- 2026-08-08 — code-feature (docfoundry ocr): pass on attempt 2, ~107k
+  tokens. Second confirmed case of codex resolving an ownership-grep
+  failure DESTRUCTIVELY: the check flagged the orchestrator's own
+  uncommitted manifest as an unexpected untracked file, and on retry codex
+  deleted it (prior case 2026-08-08 outline-garble: reverted uncommitted
+  contract+tests). The model treats the check's failure output as the spec.
+  Orchestrator rule: commit contract, tests, AND the manifest before
+  dispatching any diff/untracked-grep-checked task.
 - 2026-07-05 — carried the heavy lanes of the milk-crate demo rehearsals
   (market read with source allowlist, site build) with clean first-attempt
   passes.
@@ -82,6 +90,21 @@ checks and raw logs support — no vibes, no worker self-reports.
   check. Review lane found the HIGH that mattered (sync cursor skipping a
   half-written trailing line). Codex is the proven lane for both sides of
   the review->fix loop on this codebase.
+
+- 2026-08-08 — code-fix (docfoundry REJECT_STITCHED verdict in cite.py, run
+  docfoundry-contiguous-quote): 1st-try pass, 38.9k tokens, 97s. Small
+  well-specified single-file change against 8 pre-written red tests —
+  codex baseline holds.
+
+- 2026-08-08 — code-fix (docfoundry outline×garble xref, run
+  docfoundry-outline-garble-xref): 2 attempts, 98k tokens. Attempt-1 fail
+  was the ORCHESTRATOR'S fault: the ownership check grepped `git diff`
+  but the orchestrator's own contract+test edits were uncommitted, so
+  they read as violations. On retry codex "fixed" it by REVERTING the
+  orchestrator's files — it satisfied the literal check over the spec's
+  hard rule (never touch tests/CONTRACTS). Lesson: commit contract+tests
+  BEFORE dispatching, or exclude them in the ownership grep; and expect
+  codex to treat the check's failure output as the true spec on retry.
 
 ## glm-5.2 via opencode (`openrouter/z-ai/glm-5.2`)
 
