@@ -14,6 +14,16 @@ checks and raw logs support — no vibes, no worker self-reports.
 
 ## codex (GPT-5-class, own harness)
 
+- 2026-08-09 — code-feature (claude-memory index-numbering, worktree, 413k
+  tokens, 2 attempts): work was excellent (full ledger+CLI feature, 15 new
+  tests, conservative design interpretations) but check FAILED both attempts
+  because the Mac has NO system pytest anywhere — worker hunted one down in an
+  unrelated project's venv and verified there, so its "318 passed" claim was
+  real but unreproducible by the check's bare python3. Orchestrator verified
+  independently in a fresh venv: genuinely green, patch applied. Lesson: on
+  this Mac, any pytest-based check must provision its own interpreter (venv)
+  — never assume `python3 -m pytest` resolves.
+
 - Strongest general worker; the default engine. Spend reasoning effort per
   task via `engine_args` (`["-c", "model_reasoning_effort=low|medium|high"]`)
   — high on gnarly tasks, low on boilerplate.
@@ -247,6 +257,19 @@ checks and raw logs support — no vibes, no worker self-reports.
   on long structured code review (after nemotron-3-super) — the exploration
   ladder now says: audition free models on SHORT mechanical tasks first;
   long-diff review is a proven-tier lane.
+
+## ling-3.0-tiny via opencode (`openrouter/inclusionai/ling-3.0-tiny:free`)
+
+- 2026-08-09 — probe (tokenizer measurement, first audition): PASS first try,
+  150k tokens, ~19min. Executed check held (script ran, report numbers matched
+  stdout). BUT it satisfied "use a real BPE tokenizer" by training a toy BPE
+  on the 22KB corpus itself — sandbox blocked pip, and the letter-not-spirit
+  fallback made its id-style comparison worthless (toy vocab has no digit
+  merges). Corpus-level % was directionally right (28.9% vs tiktoken's
+  28.6–33.2%). Promotion: untested -> probation for probe. Lesson: when a spec
+  says "install X or find an equivalent", a tiny model will take the weakest
+  reading — pin the acceptable tokenizers/tools by name in the CHECK, not
+  just the spec.
 
 ## Small / flash-class models
 
