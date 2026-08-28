@@ -5760,21 +5760,44 @@ class EvalLogger:
     def log_attempt(self, row: dict[str, Any]) -> None:
         if self._conn is not None:
             db_row = {
-                key: value
-                for key, value in row.items()
-                if key not in {"model", "reasoning_effort", "task_type", "retry"}
+                key: row.get(key)
+                for key in (
+                    "run_id",
+                    "pattern",
+                    "task_key",
+                    "spec",
+                    "worker_engine",
+                    "shepherd_model",
+                    "verify_method",
+                    "verdict",
+                    "duration_ms",
+                    "worker_tokens",
+                    "notes",
+                    "orchestrator",
+                    "model",
+                    "reported_model",
+                    "expected_model",
+                    "reasoning_effort",
+                    "task_type",
+                    "retry",
+                )
             }
+            db_row["payload"] = json.dumps(row, sort_keys=True, default=str)
             try:
                 self._conn.execute(
                     """
                     INSERT INTO swarm_runs (
                         run_id, pattern, task_key, spec, worker_engine, shepherd_model,
-                        verify_method, verdict, duration_ms, worker_tokens, notes, orchestrator
+                        verify_method, verdict, duration_ms, worker_tokens, notes, orchestrator,
+                        model, reported_model, expected_model, reasoning_effort, task_type, retry,
+                        payload
                     )
                     VALUES (
                         %(run_id)s, %(pattern)s, %(task_key)s, %(spec)s, %(worker_engine)s,
                         %(shepherd_model)s, %(verify_method)s, %(verdict)s, %(duration_ms)s,
-                        %(worker_tokens)s, %(notes)s, %(orchestrator)s
+                        %(worker_tokens)s, %(notes)s, %(orchestrator)s, %(model)s,
+                        %(reported_model)s, %(expected_model)s, %(reasoning_effort)s,
+                        %(task_type)s, %(retry)s, %(payload)s::jsonb
                     )
                     """,
                     db_row,
