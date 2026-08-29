@@ -114,6 +114,68 @@ def write_catalog(path: Path) -> None:
     )
 
 
+class FakeDrainPostgresConnection:
+    def __init__(self, *, fail_insert: bool = False) -> None:
+        self.fail_insert = fail_insert
+        self.insert_parameters: list[dict[str, object]] = []
+        self.pending: list[dict[str, object]] = []
+        self.rows: list[dict[str, object]] = []
+        self.events: list[str] = []
+        self.commits = 0
+        self.rollbacks = 0
+        self.closed = False
+        self.after_first_insert: object = None
+
+    def execute(self, sql: str, parameters: object) -> object:
+        if "INSERT INTO swarm_runs" in sql:
+            self.events.append("insert")
+            if self.fail_insert:
+                raise RuntimeError("insert exploded")
+            values = dict(parameters)  # type: ignore[arg-type]
+            self.insert_parameters.append(values)
+            self.pending.append(values)
+            callback = self.after_first_insert
+            self.after_first_insert = None
+            if callable(callback):
+                callback()
+            return None
+        if "FROM swarm_runs" in sql:
+            self.events.append("select")
+            watermark = int(parameters[0])  # type: ignore[index]
+            selected = [row for row in self.rows if int(row["id"]) > watermark]
+            return FakePostgresCursor(selected)
+        raise AssertionError(f"unexpected SQL: {sql}")
+
+    def commit(self) -> None:
+        self.events.append("commit")
+        self.commits += 1
+        for values in self.pending:
+            self.rows.append(
+                {
+                    "id": len(self.rows) + 1,
+                    "logged_at": values["logged_at"],
+                    "payload": values["payload"],
+                }
+            )
+        self.pending.clear()
+
+    def rollback(self) -> None:
+        self.events.append("rollback")
+        self.rollbacks += 1
+        self.pending.clear()
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakePostgresCursor:
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        self.rows = rows
+
+    def fetchall(self) -> list[dict[str, object]]:
+        return self.rows
+
+
 class ModelDbTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -460,6 +522,234 @@ class ModelDbTests(unittest.TestCase):
         self.assertEqual(
             "models: Postgres read-model sync skipped (database unavailable)\n",
             err.getvalue(),
+        )
+
+    def test_postgres_sync_drains_fallback_rows_before_select_exactly_once(self) -> None:
+        rows = [
+            {
+                **attempt(run_id="fallback-1", retry=True),
+                "log_sink": "jsonl",
+                "fallback_reason": "database unavailable",
+                "extra": {"lossless": True},
+            },
+            {
+                **attempt(
+                    run_id="fallback-2",
+                    logged_at="2026-07-06T11:00:00+00:00",
+                ),
+                "log_sink": "jsonl",
+                "fallback_reason": "insert failed",
+            },
+        ]
+        write_jsonl(self.log_path, rows)
+        original = self.log_path.read_bytes()
+        sync_read_model_db(
+            self.db_path,
+            self.log_path,
+            catalog_path=self.catalog_path,
+            registry_path=self.registry_path,
+        )
+        postgres = FakeDrainPostgresConnection()
+
+        result = sync_read_model_db(
+            self.db_path,
+            self.log_path,
+            catalog_path=self.catalog_path,
+            registry_path=self.registry_path,
+            eval_config=self.postgres_eval_config(),
+            postgres_connection_factory=lambda _config: postgres,
+        )
+
+        self.assertTrue(result.rebuilt)
+        self.assertEqual(2, result.attempts_inserted)
+        self.assertEqual(2, result.postgres_inserted)
+        self.assertEqual(2, result.postgres_drained)
+        self.assertEqual(1, postgres.commits)
+        self.assertEqual(0, postgres.rollbacks)
+        self.assertEqual(["insert", "insert", "commit", "select"], postgres.events)
+        self.assertEqual(2, len(postgres.insert_parameters))
+        standard_keys = set(ringer.POSTGRES_ATTEMPT_COLUMNS)
+        for row, parameters in zip(rows, postgres.insert_parameters):
+            self.assertTrue(standard_keys.issubset(parameters))
+            self.assertEqual(row["logged_at"], parameters["logged_at"])
+            self.assertIsInstance(parameters["retry"], bool)
+            self.assertEqual(row, json.loads(str(parameters["payload"])))
+        self.assertIsNotNone(result.postgres_drain_archive)
+        archive = result.postgres_drain_archive
+        assert archive is not None
+        self.assertEqual(original, archive.read_bytes())
+        self.assertTrue(archive.name.startswith("runs.jsonl.drained-"))
+        self.assertFalse(self.log_path.exists())
+        with sqlite3.connect(self.db_path) as conn:
+            counts = dict(
+                conn.execute(
+                    "SELECT run_id, COUNT(*) FROM attempts GROUP BY run_id ORDER BY run_id"
+                ).fetchall()
+            )
+        self.assertEqual({"fallback-1": 1, "fallback-2": 1}, counts)
+
+    def test_fallback_drain_absent_and_empty_logs_are_no_ops(self) -> None:
+        postgres = FakeDrainPostgresConnection()
+
+        absent = ringer.drain_jsonl_fallback_rows(self.log_path, postgres)
+        self.assertEqual(ringer.JsonlFallbackDrainResult(), absent)
+        self.log_path.touch()
+        empty = ringer.drain_jsonl_fallback_rows(self.log_path, postgres)
+
+        self.assertEqual(ringer.JsonlFallbackDrainResult(), empty)
+        self.assertTrue(self.log_path.exists())
+        self.assertEqual(b"", self.log_path.read_bytes())
+        self.assertEqual([], postgres.events)
+        self.assertEqual([], list(self.root.glob("runs.jsonl.*")))
+
+    def test_fallback_drain_does_not_invent_missing_logged_at(self) -> None:
+        row = {
+            "run_id": "fallback-undated",
+            "retry": "false",
+            "log_sink": "jsonl",
+            "fallback_reason": "database unavailable",
+            "extra": {"preserved": True},
+        }
+        write_jsonl(self.log_path, [row])
+        postgres = FakeDrainPostgresConnection()
+
+        result = ringer.drain_jsonl_fallback_rows(self.log_path, postgres)
+
+        self.assertEqual(1, result.rows_drained)
+        self.assertEqual(1, postgres.commits)
+        self.assertIsNone(postgres.insert_parameters[0]["logged_at"])
+        self.assertIs(False, postgres.insert_parameters[0]["retry"])
+        self.assertEqual(row, json.loads(str(postgres.insert_parameters[0]["payload"])))
+
+    def test_fallback_drain_insert_failure_restores_jsonl_and_sync_fails_open(self) -> None:
+        row = {
+            **attempt(run_id="fallback-failed"),
+            "log_sink": "jsonl",
+            "fallback_reason": "database unavailable",
+        }
+        write_jsonl(self.log_path, [row])
+        original = self.log_path.read_bytes()
+        postgres = FakeDrainPostgresConnection(fail_insert=True)
+        err = io.StringIO()
+
+        with contextlib.redirect_stderr(err):
+            result = sync_read_model_db(
+                self.db_path,
+                self.log_path,
+                catalog_path=self.catalog_path,
+                registry_path=self.registry_path,
+                eval_config=self.postgres_eval_config(),
+                postgres_connection_factory=lambda _config: postgres,
+            )
+
+        self.assertEqual(1, result.attempts_inserted)
+        self.assertEqual(0, result.postgres_inserted)
+        self.assertIsNone(result.postgres_source)
+        self.assertEqual(1, postgres.rollbacks)
+        self.assertEqual(original, self.log_path.read_bytes())
+        self.assertEqual([], list(self.root.glob("runs.jsonl.draining-*")))
+        self.assertEqual([], list(self.root.glob("runs.jsonl.drained-*")))
+        self.assertEqual(1, self.count_attempts())
+        self.assertEqual(
+            "models: Postgres read-model sync skipped (insert exploded)\n",
+            err.getvalue(),
+        )
+
+    def test_fallback_drain_rechecks_rotated_file_for_late_append(self) -> None:
+        first = attempt(run_id="fallback-first")
+        late = attempt(run_id="fallback-late", logged_at="2026-07-06T12:00:00+00:00")
+        write_jsonl(self.log_path, [first])
+        postgres = FakeDrainPostgresConnection()
+
+        def append_to_rotated_file() -> None:
+            draining = list(self.root.glob("runs.jsonl.draining-*"))
+            self.assertEqual(1, len(draining))
+            with draining[0].open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(late) + "\n")
+
+        postgres.after_first_insert = append_to_rotated_file
+        result = ringer.drain_jsonl_fallback_rows(self.log_path, postgres)
+
+        self.assertEqual(2, result.rows_drained)
+        self.assertEqual(1, postgres.commits)
+        self.assertEqual(
+            ["fallback-first", "fallback-late"],
+            [json.loads(str(row["payload"]))["run_id"] for row in postgres.insert_parameters],
+        )
+        assert result.archive_path is not None
+        archived = result.archive_path.read_text(encoding="utf-8")
+        self.assertIn('"run_id": "fallback-first"', archived)
+        self.assertIn('"run_id": "fallback-late"', archived)
+
+    def test_jsonl_backend_never_drains(self) -> None:
+        write_jsonl(self.log_path, [attempt(run_id="jsonl-only")])
+
+        def unexpected_connect(_config: PostgresEvalConfig) -> object:
+            raise AssertionError("jsonl backend must not connect")
+
+        result = sync_read_model_db(
+            self.db_path,
+            self.log_path,
+            catalog_path=self.catalog_path,
+            registry_path=self.registry_path,
+            eval_config=EvalConfig(backend="jsonl", jsonl_path=self.log_path),
+            postgres_connection_factory=unexpected_connect,
+        )
+
+        self.assertEqual(1, result.attempts_inserted)
+        self.assertTrue(self.log_path.exists())
+        self.assertEqual([], list(self.root.glob("runs.jsonl.drained-*")))
+
+    def test_fallback_drain_archives_and_counts_malformed_lines(self) -> None:
+        valid = {
+            **attempt(run_id="fallback-valid"),
+            "log_sink": "jsonl",
+            "fallback_reason": "database unavailable",
+        }
+        original = b"not-json\n" + json.dumps(valid).encode("utf-8") + b"\n[1, 2]\n"
+        self.log_path.write_bytes(original)
+        postgres = FakeDrainPostgresConnection()
+
+        result = sync_read_model_db(
+            self.db_path,
+            self.log_path,
+            catalog_path=self.catalog_path,
+            registry_path=self.registry_path,
+            eval_config=self.postgres_eval_config(),
+            postgres_connection_factory=lambda _config: postgres,
+        )
+
+        self.assertEqual(1, result.postgres_drained)
+        self.assertEqual(2, result.postgres_drain_skipped)
+        self.assertEqual(2, result.skipped)
+        assert result.postgres_drain_archive is not None
+        self.assertEqual(original, result.postgres_drain_archive.read_bytes())
+        self.assertEqual(1, self.count_attempts())
+
+    def test_models_header_reports_fallback_drain(self) -> None:
+        write_jsonl(self.log_path, [attempt(run_id="fallback-header")])
+        postgres = FakeDrainPostgresConnection()
+        args = self.model_args()
+        args.json = False
+        out = io.StringIO()
+
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(
+                0,
+                run_models_command(
+                    self.config(self.postgres_eval_config()),
+                    args,
+                    postgres_connection_factory=lambda _config: postgres,
+                ),
+            )
+
+        archive = next(self.root.glob("runs.jsonl.drained-*"))
+        self.assertTrue(
+            out.getvalue().startswith(
+                f"Model log: {self.log_path} (1 rows, 0 skipped lines); "
+                "Postgres swarm_runs (1 new rows); drained 1 JSONL fallback rows to "
+                f"{archive.name}\n"
+            )
         )
 
     def test_catalog_sync_skips_unchanged_files_and_appends_new_events_only(self) -> None:

@@ -6996,6 +6996,16 @@ class ReadModelSyncResult:
     rebuilt: bool
     postgres_inserted: int = 0
     postgres_source: str | None = None
+    postgres_drained: int = 0
+    postgres_drain_archive: Path | None = None
+    postgres_drain_skipped: int = 0
+
+
+@dataclass(frozen=True)
+class JsonlFallbackDrainResult:
+    rows_drained: int = 0
+    skipped: int = 0
+    archive_path: Path | None = None
 
 
 POSTGRES_ATTEMPT_COLUMNS = (
@@ -7020,6 +7030,165 @@ POSTGRES_ATTEMPT_COLUMNS = (
 )
 POSTGRES_SYNC_COLUMNS = ("id", "logged_at", *POSTGRES_ATTEMPT_COLUMNS, "payload")
 POSTGRES_SYNC_SOURCE = "Postgres swarm_runs"
+
+POSTGRES_ATTEMPT_INSERT_SQL = """
+INSERT INTO swarm_runs (
+    logged_at, run_id, pattern, task_key, spec, worker_engine, shepherd_model,
+    verify_method, verdict, duration_ms, worker_tokens, notes, orchestrator,
+    model, reported_model, expected_model, reasoning_effort, task_type, retry,
+    payload
+)
+VALUES (
+    %(logged_at)s, %(run_id)s, %(pattern)s, %(task_key)s, %(spec)s,
+    %(worker_engine)s, %(shepherd_model)s, %(verify_method)s, %(verdict)s,
+    %(duration_ms)s, %(worker_tokens)s, %(notes)s, %(orchestrator)s, %(model)s,
+    %(reported_model)s, %(expected_model)s, %(reasoning_effort)s,
+    %(task_type)s, %(retry)s, %(payload)s::jsonb
+)
+"""
+
+
+def postgres_attempt_insert_parameters(row: dict[str, Any]) -> dict[str, Any]:
+    parameters = {column: row.get(column) for column in POSTGRES_ATTEMPT_COLUMNS}
+    retry = row.get("retry")
+    if isinstance(retry, str):
+        normalized_retry = retry.strip().lower()
+        retry = (
+            normalized_retry == "true" if normalized_retry in {"true", "false"} else None
+        )
+    parameters["retry"] = retry if isinstance(retry, bool) else None
+    logged_at = row.get("logged_at")
+    parameters["logged_at"] = (
+        logged_at if isinstance(logged_at, str) and logged_at.strip() else None
+    )
+    parameters["payload"] = json.dumps(row, sort_keys=True, default=str)
+    return parameters
+
+
+def _read_jsonl_drain_chunk(
+    path: Path,
+    offset: int,
+) -> tuple[list[dict[str, Any]], int, int]:
+    size_before = path.stat().st_size
+    with path.open("rb") as fh:
+        fh.seek(offset)
+        data = fh.read(max(0, size_before - offset))
+    size_after_read = path.stat().st_size
+    process_length = len(data)
+    if data and not data.endswith(b"\n") and size_after_read != size_before:
+        process_length = data.rfind(b"\n") + 1
+    rows: list[dict[str, Any]] = []
+    skipped = 0
+    for raw_line in data[:process_length].splitlines():
+        try:
+            row = json.loads(raw_line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            skipped += 1
+            continue
+        if not isinstance(row, dict):
+            skipped += 1
+            continue
+        rows.append(row)
+    return rows, skipped, offset + process_length
+
+
+def _jsonl_has_object_row(path: Path) -> bool:
+    try:
+        with path.open("rb") as fh:
+            for raw_line in fh:
+                try:
+                    row = json.loads(raw_line.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if isinstance(row, dict):
+                    return True
+    except FileNotFoundError:
+        return False
+    return False
+
+
+def _restore_draining_jsonl(draining_path: Path, log_path: Path) -> None:
+    if not log_path.exists():
+        draining_path.rename(log_path)
+        return
+    # A writer may have recreated the active path after rotation. Append that
+    # new stream behind the original bytes, then atomically restore the old
+    # inode name. Keeping the original prefix also preserves its byte offset.
+    copied = 0
+    with draining_path.open("ab") as destination:
+        while True:
+            size_before = log_path.stat().st_size
+            with log_path.open("rb") as source:
+                source.seek(copied)
+                chunk = source.read(max(0, size_before - copied))
+            destination.write(chunk)
+            copied += len(chunk)
+            if log_path.stat().st_size == copied:
+                break
+    draining_path.replace(log_path)
+
+
+def drain_jsonl_fallback_rows(
+    log_path: Path,
+    postgres_connection: Any,
+) -> JsonlFallbackDrainResult:
+    """Move fallback JSONL rows to Postgres without rewriting the live log."""
+    log_path = log_path.expanduser().resolve()
+    try:
+        if log_path.stat().st_size == 0:
+            return JsonlFallbackDrainResult()
+    except FileNotFoundError:
+        return JsonlFallbackDrainResult()
+    if not _jsonl_has_object_row(log_path):
+        return JsonlFallbackDrainResult()
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    draining_path = log_path.with_name(f"{log_path.name}.draining-{timestamp}")
+    archive_path = log_path.with_name(f"{log_path.name}.drained-{timestamp}")
+    log_path.rename(draining_path)
+    rows_drained = 0
+    skipped = 0
+    offset = 0
+
+    def insert_stable_file() -> None:
+        nonlocal offset, rows_drained, skipped
+        while True:
+            rows, chunk_skipped, new_offset = _read_jsonl_drain_chunk(
+                draining_path,
+                offset,
+            )
+            for row in rows:
+                postgres_connection.execute(
+                    POSTGRES_ATTEMPT_INSERT_SQL,
+                    postgres_attempt_insert_parameters(row),
+                )
+            rows_drained += len(rows)
+            skipped += chunk_skipped
+            offset = new_offset
+            if draining_path.stat().st_size == offset:
+                break
+
+    transaction_factory = getattr(postgres_connection, "transaction", None)
+    try:
+        if callable(transaction_factory):
+            with transaction_factory():
+                insert_stable_file()
+        else:
+            try:
+                insert_stable_file()
+                postgres_connection.commit()
+            except Exception:
+                postgres_connection.rollback()
+                raise
+    except Exception:
+        _restore_draining_jsonl(draining_path, log_path)
+        raise
+
+    if rows_drained == 0:
+        _restore_draining_jsonl(draining_path, log_path)
+        return JsonlFallbackDrainResult()
+    draining_path.rename(archive_path)
+    return JsonlFallbackDrainResult(rows_drained, skipped, archive_path)
 
 
 def connect_eval_postgres(config: PostgresEvalConfig) -> Any:
@@ -7074,11 +7243,36 @@ def postgres_attempt_row(record: Any) -> tuple[int, dict[str, Any]]:
             if values.get(key) is not None
         }
     logged_at = values.get("logged_at")
-    if logged_at is None:
+    if logged_at is not None:
+        isoformat = getattr(logged_at, "isoformat", None)
+        row["logged_at"] = isoformat() if callable(isoformat) else str(logged_at)
+    elif payload is None:
         raise ValueError(f"Postgres swarm_runs id {row_id} has no logged_at value")
-    isoformat = getattr(logged_at, "isoformat", None)
-    row["logged_at"] = isoformat() if callable(isoformat) else str(logged_at)
     return row_id, row
+
+
+def _sync_postgres_attempt_rows_on_connection(conn: Any, pg_conn: Any) -> tuple[int, str]:
+    last_id = read_sync_state_int(conn, "pg_last_id", 0)
+    cursor = pg_conn.execute(
+        """
+        SELECT id, logged_at,
+               run_id, pattern, task_key, spec, worker_engine, shepherd_model,
+               verify_method, verdict, duration_ms, worker_tokens, notes, orchestrator,
+               model, reported_model, expected_model, reasoning_effort, task_type, retry,
+               payload
+        FROM swarm_runs
+        WHERE id > %s
+        ORDER BY id
+        """,
+        (last_id,),
+    )
+    records = cursor.fetchall() if hasattr(cursor, "fetchall") else list(cursor)
+    converted = [postgres_attempt_row(record) for record in records]
+    rows = [row for _row_id, row in converted]
+    inserted = insert_attempt_rows(conn, rows)
+    new_last_id = max((row_id for row_id, _row in converted), default=last_id)
+    write_sync_state_values(conn, {"pg_last_id": new_last_id})
+    return inserted, POSTGRES_SYNC_SOURCE
 
 
 def sync_postgres_attempt_rows(
@@ -7095,23 +7289,8 @@ def sync_postgres_attempt_rows(
     factory = connection_factory or connect_eval_postgres
     pg_conn: Any | None = None
     try:
-        last_id = read_sync_state_int(conn, "pg_last_id", 0)
         pg_conn = factory(eval_config.postgres)
-        cursor = pg_conn.execute(
-            """
-            SELECT id, logged_at,
-                   run_id, pattern, task_key, spec, worker_engine, shepherd_model,
-                   verify_method, verdict, duration_ms, worker_tokens, notes, orchestrator,
-                   model, reported_model, expected_model, reasoning_effort, task_type, retry,
-                   payload
-            FROM swarm_runs
-            WHERE id > %s
-            ORDER BY id
-            """,
-            (last_id,),
-        )
-        records = cursor.fetchall() if hasattr(cursor, "fetchall") else list(cursor)
-        converted = [postgres_attempt_row(record) for record in records]
+        return _sync_postgres_attempt_rows_on_connection(conn, pg_conn)
     except Exception as exc:
         note = re.sub(r"\s+", " ", str(exc)).strip()
         print(f"models: Postgres read-model sync skipped ({note})", file=sys.stderr)
@@ -7120,11 +7299,6 @@ def sync_postgres_attempt_rows(
         if pg_conn is not None:
             with contextlib.suppress(Exception):
                 pg_conn.close()
-    rows = [row for _row_id, row in converted]
-    inserted = insert_attempt_rows(conn, rows)
-    new_last_id = max((row_id for row_id, _row in converted), default=last_id)
-    write_sync_state_values(conn, {"pg_last_id": new_last_id})
-    return inserted, POSTGRES_SYNC_SOURCE
 
 
 def rebuild_read_model_db(
@@ -7185,32 +7359,61 @@ def sync_read_model_db(
     log_path = log_path.expanduser().resolve()
     catalog_path = (catalog_path or default_catalog_path()).expanduser().resolve()
     registry_path = (registry_path or default_model_registry_path()).expanduser().resolve()
-    try:
-        log_size = log_path.stat().st_size
-    except FileNotFoundError:
-        log_size = 0
     with contextlib.closing(connect_read_model_db(db_path)) as conn:
         conn.execute("BEGIN IMMEDIATE")
+        pg_conn: Any | None = None
+        drain_result = JsonlFallbackDrainResult()
         try:
             create_read_model_schema(conn)
             offset = read_sync_state_int(conn, "log_offset", 0)
-            if log_size < offset:
-                conn.rollback()
-                return rebuild_read_model_db(
-                    db_path,
-                    log_path,
-                    catalog_path=catalog_path,
-                    registry_path=registry_path,
-                    eval_config=eval_config,
-                    postgres_connection_factory=postgres_connection_factory,
-                )
-            rows, skipped, new_offset = read_log_rows_from_offset(log_path, offset)
-            inserted = insert_attempt_rows(conn, rows)
-            postgres_inserted, postgres_source = sync_postgres_attempt_rows(
-                conn,
-                eval_config,
-                connection_factory=postgres_connection_factory,
+            if eval_config is not None and eval_config.backend == "postgres":
+                if eval_config.postgres is None:
+                    print(
+                        "models: Postgres read-model sync skipped (postgres eval config missing)",
+                        file=sys.stderr,
+                    )
+                else:
+                    factory = postgres_connection_factory or connect_eval_postgres
+                    try:
+                        pg_conn = factory(eval_config.postgres)
+                        drain_result = drain_jsonl_fallback_rows(log_path, pg_conn)
+                    except Exception as exc:
+                        note = re.sub(r"\s+", " ", str(exc)).strip()
+                        print(
+                            f"models: Postgres read-model sync skipped ({note})",
+                            file=sys.stderr,
+                        )
+                        if pg_conn is not None:
+                            with contextlib.suppress(Exception):
+                                pg_conn.close()
+                        pg_conn = None
+            try:
+                log_size = log_path.stat().st_size
+            except FileNotFoundError:
+                log_size = 0
+            rebuilt = log_size < offset or (
+                drain_result.rows_drained > 0 and offset > 0
             )
+            if rebuilt:
+                drop_read_model_tables(conn)
+                create_read_model_schema(conn)
+                offset = 0
+            rows, skipped, new_offset = read_log_rows_from_offset(log_path, offset)
+            skipped += drain_result.skipped
+            inserted = insert_attempt_rows(conn, rows)
+            postgres_inserted = 0
+            postgres_source = None
+            if pg_conn is not None:
+                try:
+                    postgres_inserted, postgres_source = (
+                        _sync_postgres_attempt_rows_on_connection(conn, pg_conn)
+                    )
+                except Exception as exc:
+                    note = re.sub(r"\s+", " ", str(exc)).strip()
+                    print(
+                        f"models: Postgres read-model sync skipped ({note})",
+                        file=sys.stderr,
+                    )
             inserted += postgres_inserted
             refresh_catalog_tables(conn, catalog_path)
             refresh_identity_tables(conn, registry_path)
@@ -7219,15 +7422,22 @@ def sync_read_model_db(
         except Exception:
             conn.rollback()
             raise
+        finally:
+            if pg_conn is not None:
+                with contextlib.suppress(Exception):
+                    pg_conn.close()
     return ReadModelSyncResult(
         db_path,
         log_path,
         inserted,
         skipped,
         new_offset,
-        False,
+        rebuilt,
         postgres_inserted,
         postgres_source,
+        drain_result.rows_drained,
+        drain_result.archive_path,
+        drain_result.skipped,
     )
 
 
@@ -8567,10 +8777,17 @@ def print_model_log_table(
     *,
     postgres_source: str | None = None,
     postgres_inserted: int = 0,
+    postgres_drained: int = 0,
+    postgres_drain_archive: Path | None = None,
 ) -> None:
     source_note = (
         f"; {postgres_source} ({postgres_inserted} new rows)" if postgres_source else ""
     )
+    if postgres_drained and postgres_drain_archive is not None:
+        source_note += (
+            f"; drained {postgres_drained} JSONL fallback rows to "
+            f"{postgres_drain_archive.name}"
+        )
     print(f"Model log: {path} ({rows_read} rows, {skipped} skipped lines){source_note}")
     widths = (32, 20, 18, 18, 10, 7, 10, 7, 15, 14, 14, 60)
     header = " | ".join(
@@ -8724,6 +8941,8 @@ def run_models_command(
     catalog_events: list[dict[str, Any]] | None = None
     postgres_source: str | None = None
     postgres_inserted = 0
+    postgres_drained = 0
+    postgres_drain_archive: Path | None = None
     if using_db:
         try:
             sync_result = sync_read_model_db(
@@ -8736,6 +8955,8 @@ def run_models_command(
             )
             postgres_source = sync_result.postgres_source
             postgres_inserted = sync_result.postgres_inserted
+            postgres_drained = sync_result.postgres_drained
+            postgres_drain_archive = sync_result.postgres_drain_archive
             rows, identity_registry = db_attempt_rows(db_path, since=since, engine=args.engine)
             disk_registry = load_model_identity_registry(registry_path)
             identity_registry = dataclass_replace(
@@ -8820,6 +9041,8 @@ def run_models_command(
             groups,
             postgres_source=postgres_source,
             postgres_inserted=postgres_inserted,
+            postgres_drained=postgres_drained,
+            postgres_drain_archive=postgres_drain_archive,
         )
     return 0
 
