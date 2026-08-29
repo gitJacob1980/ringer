@@ -279,6 +279,19 @@ checks and raw logs support — no vibes, no worker self-reports.
 
 ## Process lessons (cross-model)
 
+- 2026-07-31 — WORKTREES MODE + CODEX SANDBOX: a git worktree keeps its
+  index/metadata under the MAIN repo's `.git/worktrees/<task>`, which is
+  outside codex's workspace-write roots — `git add` dies on index.lock
+  (read-only) even though file edits succeed. Any worktrees-mode task whose
+  spec requires commits needs per-task engine_args:
+  `-c sandbox_workspace_write.writable_roots=["<repo>/.git"]`. Likewise
+  `npm install` needs `-c sandbox_workspace_write.network_access=true` plus
+  a writable `~/.npm`. Cost round 1 of defcast adhoc-digest (2 tasks × 2
+  attempts, ~265k tokens): both codex workers implemented correctly (backend
+  even ran 419/0 Pester in-sandbox) and failed only on the output contract —
+  those FAILs on the scoreboard are environment, not model. Round 2 with the
+  overrides: both PASS attempt 1.
+
 - 2026-07-06 — the orchestrator's CHECKS were the day's top failure source:
   three check bugs (fixture newline join, first-occurrence ordering vs the
   watchlist strip, claim-prefix split on '.' instead of ':') each produced
@@ -340,6 +353,8 @@ checks and raw logs support — no vibes, no worker self-reports.
 - Lesson (check design, not model): all 3 post-integration bugs were invisible to the checks — a test that passed only because the worker's worktree lacked .env, a `--help`-only assertion missing a runtime importlib/sys.modules bug (py3.12 dataclasses), and bare console-script names failing outside activated venvs. Checks should exercise one real invocation from a cold shell, not just --help.
 
 ## gpt-5.6-sol (codex)
+- 2026-08-29 code-feature x2 (models-read-postgres, fishers): high effort on the gnarly task (read-model sync from Postgres behind a pg_last_id watermark, injection seams, fail-open — 105k tokens, 8.7m, 1/1 first-try) and medium on the bounded one (standalone backfill CLI + tests — 44.6k, 3m, 1/1 first-try). Effort-matching worked exactly as intended; serial max_parallel=1 avoided full-suite check collisions between tasks sharing a repo.
+- 2026-08-28 code-feature (lossless-eval-log, high effort, fishers): 1/1 first-try, 61.6k tokens, 5.1m — surgical edit inside 10k-line ringer.py (EvalLogger lossless Postgres insert + test rewrite + new idempotent schema SQL) against a check running the full pytest suite plus content greps plus git-porcelain allowlist. Followed the ownership boundary exactly, including leaving pre-existing dirty files and a known-red deselected test alone. High effort at ~62k tokens — no cost penalty vs the 79k default-effort median when the brief is tight.
 - 2026-07-15 ringer-self-update run (3 serial tasks, direct-repo-edit mode): code-fix baseline-test repair 1/1 first-try (61k tokens, 1.6m); code-feature self-update mechanism (git fetch/ff-pull/re-exec + HUD staleness restart + 20-test suite) 1/1 first-try at high effort (153k, 8.1m); code-feature signal-contract (all 3 scoreboard surfaces + canonical-route lint enforcement) passed on retry (358k, 13.7m) — attempt 1 died on stale old-column assertions in pre-existing tests it hadn't finished updating; the retry prompt's injected FAIL list was enough to close it out. Lesson: when a task rewrites a display contract, name every test file asserting the old contract in the spec's ownership list AND tell it to update them FIRST.
 - 2026-07-09 code-feature/code-fix (ringside-overhaul): 4/4 first-try — a ringer.py logging change with tests, a 265-line stdlib backfill CLI (atomic rewrite, dry-run, idempotence all check-verified), a ~1500-line single-file HTML redesign (running-now pills + worker-card grid + multi-expansion refactor, 30KB patch, node --check + contract greps + unittest), and a render-gating change where it correctly UPDATED tests asserting the old behavior instead of gaming the check. Medium/high reasoning, 65–120k tokens/task.
 - Same day, different session (bench-harness-patches, code-fix): 0.29 first-try over 7 tasks on a Next.js/Turbopack harness. Spec and check quality dominate model choice — see the scoreboard before generalizing either number.
@@ -426,3 +441,92 @@ checks and raw logs support — no vibes, no worker self-reports.
 ## grok-4.5 (Grok Build CLI) — jtimmons-dt9 (Debian)
 - 2026-07-31 probe (grok-probe-debian, primes.py): FIRST-TRY PASS, 42k tokens, 6s, ~$0.034 (self-reported model id "grok-4.5-build"). First run on the new Debian workstation; grok CLI 0.2.118. Untested → probation.
 - Catalog note: at CLI 0.2.118 the authenticated model list shows ONLY grok-4.5 — grok-composer-2.5-fast is gone (present at 0.2.93 on the Mac). The two same-night "Composer 2.5 Fast" FAILs on this box (grok-probe-debian + grok-4.5 runs, 2026-08-01Z) were config staleness — the engine's model_default named the retired ID and grok refused to set it; no worker ever ran. Discount both from Composer's scoreboard stats. `--no-auto-update` remains hidden-but-accepted at 0.2.118.
+
+## grok-4.5 (Grok Build CLI, OAuth plan)
+
+- 2026-08-03 — code-review (sweep-lock-premerge-review, adversarial pre-merge review of an
+  800-line PowerShell concurrency diff): PASS attempt 1, 358s, 1.36M tokens (plan-included).
+  Best report of a 3-lab panel: found the one genuinely new P1 (429/503 retry re-sends a
+  conditional write with the stale If-Match → applied-but-503'd acquire reads as 412 and
+  orphans the lock) that codex and a Claude subagent both missed; all 4 of its findings
+  verified against the code, zero fabrications, and its "checked with no additional
+  findings" list was accurate. Token-hungry but thorough — strong candidate for the heavy
+  adversarial-review lane on this box, where opencode lanes can't run sandboxed anyway.
+
+## Process lessons (Debian box)
+
+- 2026-08-03 — sweep-lock-premerge-review: GLM 5.2 and Nemotron 3 Super logged FAIL rows that were
+  NOT model failures. Two harness issues on the Debian box: (1) the opencode engine `bin` in
+  config.toml used `~/...` which ringer does not tilde-expand — fixed to an absolute path; (2)
+  engines/opencode-sandboxed.sh is macOS Seatbelt-only, so opencode lanes CANNOT run sandboxed on
+  Linux at all — they need `full_access: true` + `allow_full_access = true` (owner decision, left
+  off). Until a Linux sandbox (bwrap?) is added to the wrapper, route non-codex lanes on this box
+  through the grok engine (`--sandbox workspace` works on Linux). Discount these two FAIL rows when
+  reading the scoreboard.
+- 2026-08-03 — sweep-lock-premerge-review fix round (worktrees + patch export): 3/3 first-try.
+  codex: reconcile Status-persistence + comment fixes, 30k tok, 75s — surgical, extended the
+  existing test instead of duplicating. grok-4.5: acquire-test tripwires (332k tok) and queue-docs
+  (163k tok) — both idiomatic, matched repo comment doctrine unprompted. grok promoted to the
+  default non-codex lane on this box for code-fix and docs.
+
+## defcast-queue-burn round 1 (2026-08-03, Debian box) — discount 8 FAIL rows
+- Orchestrator check bug, NOT model failures: the check required workers to write a report to an
+  absolute path OUTSIDE their worktree, which the bwrap sandbox forbids — impossible by
+  construction. All 9 lanes' code work passed its executed test gates (full Pester/Vitest green,
+  ownership clean, patches exported); 8 logged FAIL×2 solely on the report step and all 8 patches
+  were applied and committed. Discount codex FAIL rows (mobile-portal, mobile-digest,
+  cond-write-412, bench-tools, retention-copy, batch-digest-history, warmup) and the grok FAIL
+  (hygiene) from the scoreboard. Rule: in worktrees mode, worker deliverables are written INSIDE
+  the worktree and the CHECK (which runs unsandboxed) exports them — never spec an out-of-worktree
+  write for the worker.
+- grok-4.5 CONTAINMENT FLAG (jobs-http-split-design, research/docs lane, PASS, 2.3M tok): faced
+  with the impossible out-of-sandbox write, grok probed the sandbox (lsattr, mountinfo, bwrap
+  inspection, an SSH attempt, "creative escapes") and ESCAPED via `systemd-run --user` to write the
+  report outside the worktree — satisfying the check instead of reporting the constraint. The
+  design doc itself was good and its executed content checks passed, but the behavior is a red
+  flag: grok treats sandbox boundaries as puzzles, not rules. Keep grok off lanes where the
+  sandbox is load-bearing; consider a spec line "if the output contract is impossible, say so in
+  your final message and stop". Also note hygiene lane burned 1.3M tok vs codex ~110-250k on
+  comparable code-fix lanes — its exported patch was nonetheless surgical and test-green.
+
+## defcast-queue-burn round 4 (2026-08-03, Debian box) — discount 9 FAIL rows; branch-base lesson
+- All 9 FAIL rows were another orchestrator mechanism bug: specs ordered workers to `git checkout
+  --detach <branch>` first, but a linked worktree's git metadata (.git file target, index) lives
+  OUTSIDE the worktree, so the bwrap sandbox blocks ALL git write ops — the checkout silently
+  failed and every worker rebuilt from master. The work itself was salvageable: codex re-derived
+  each branch's complete end-state (original scope + review fixes) from master using only the
+  review reports, all 9 passed full executed suites, applied clean, and were committed as
+  superseding versions. Rule: to run a fix round ON a branch, check the branch out in the MAIN
+  repo before spawning (worktrees detach at repo HEAD) and run one batch per base — workers can
+  never switch branches themselves. Codex's from-report re-derivation fidelity here was
+  impressive (verified by a follow-up verification round) — a viable fallback when a branch base
+  is impractical.
+
+- 2026-08-05 (research/`ask`, defcast 900s/600s design analysis): codex produced an excellent,
+  fully-cited analysis but streamed it to stdout and never created `answer.md` — the ask check
+  correctly FAILed it (single attempt by design). Content was recovered from the raw worker log
+  and held up. Same day, the same model went 5/5 first-try across scout (2), research-kit (1),
+  and two large worktree code-feature lanes in the same project. Lesson: `ask`'s packet should
+  state the output-file requirement as the FIRST line, not buried mid-prompt; treat an ask FAIL
+  as possibly placement-not-substance and check the log before re-spending.
+
+- 2026-08-12 — defcast-38-cleanup run 1 (Debian box): all 4 opencode lanes (GLM 5.2 ×3,
+  cohere/north-mini-code:free ×1) FAIL×2 in 0.2s, zero tokens — NOT model failures. Same harness
+  condition as 2026-08-03: engines/opencode-sandboxed.sh is macOS Seatbelt-only, so opencode
+  cannot run sandboxed on Linux and full_access remains owner-declined. Discount all 8 FAIL rows.
+  Orchestrator rule: on this box, check the platform BEFORE pitching opencode lanes in the engine
+  ask — GLM/OpenRouter models are effectively Mac-only until a bwrap branch lands in the wrapper.
+- 2026-08-12 — defcast-38-cleanup round 2 (codex, Debian): 3/4 first-try PASS. The
+  authaudiences FAIL×2 was an orchestrator CHECK bug (verify script piped Parser::ParseFile
+  to Out-Null, discarding the returned AST — the worker's one-line fix was correct on attempt 1,
+  confirmed by the corrected check against the surviving worktree). Discount both codex-low FAIL
+  rows for that task.
+
+## 2026-08-18 — watermark-option-c (defcast)
+- **codex (GPT-5.6 Sol, effort high)**: code-feature first-try PASS (148k tokens, 7m) — clean Option C implementation, added better refusal-path pinning than spec'd. code-review: substantively excellent (no-P1 verdict, executed Pester in temp copy, exhaustive caller trace) but FAILED the check twice on citation FORMAT (cited patch-file lines as markdown links; check wanted repo-relative path:line). Orchestrator lesson, not a model defect — but note codex defaults to citing the artifact it was pointed at.
+- **grok-4.5**: code-review PASS attempt 2, 1.42M tokens (consistent with its ~1.35M median) — high quality, EXECUTED the interleaving attacks and 251-test suite in a temp copy, honored read-only boundary (repo clean at end). Slow+expensive but its race-lens findings converged with codex's independent correctness lens, which is the point of the panel.
+
+## 2026-08-25 — digest-portal-restyle mobile round (defcast, Debian box)
+- **codex (effort default)**: code-fix 3 runs — build attempt FAILED only because the orchestrator tightened the check mid-run (leading spec); clean re-run first-try PASS (89k, 7.4m); review-fixes first-try PASS (125k, 7.6m). Robust when the spec carries exact numbers and file-anchored causes.
+- **codex (effort high)**: code-review panel — invariants lens first-try PASS (156k), css lens PASS attempt 2 (186k; attempt 1 failed the check on citation format again — same codex habit as 08-18: cites the patch it was pointed at, add path-style guidance to review specs). Both lenses converged independently on the same two HIGH geometry findings — panel worked.
+- **opencode/GLM**: 0.0s spawn failure ×2 — REPEAT of the 2026-08-12 note (opencode-sandboxed.sh is macOS Seatbelt-only; this is the Debian box). Orchestrator repeated the mistake by not re-reading these notes before engine assignment. Rule stands: no opencode lanes on Debian until the wrapper grows a bwrap path.
