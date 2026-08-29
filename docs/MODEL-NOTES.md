@@ -212,6 +212,17 @@ checks and raw logs support — no vibes, no worker self-reports.
   to k2.7.
 
 
+## grok-4.5 (Grok CLI engine, flat plan) — 2026-08-29 addendum
+
+- 2026-08-29 — code-review (defcast-16-build-plan-review, concurrency lens,
+  fishers, grok-4.5): PASS first try, 584k tokens (432k cache reads), 396s,
+  $0.17 metered. Found a REAL latent bug in shipped code (control-row claim
+  path missing the 503-then-412 self-confirm the lock path has) plus a P0
+  fail-open gate flaw — second time grok-4.5 has caught a defcast concurrency
+  defect others framed past (#33 was also its find, 2026-08-03). Raw JSON
+  'thought' stream shows messy interim drafts; the final report.md was clean
+  and evidence-dense. Keep grok-4.5 on lock/interleaving review lanes.
+
 ## grok-build (Grok CLI engine, flat plan)
 
 - 2026-07-10 — identity correction (Jon): the Grok Build CLI is a HARNESS
@@ -359,6 +370,13 @@ checks and raw logs support — no vibes, no worker self-reports.
 - 2026-07-15 ringer-self-update run (3 serial tasks, direct-repo-edit mode): code-fix baseline-test repair 1/1 first-try (61k tokens, 1.6m); code-feature self-update mechanism (git fetch/ff-pull/re-exec + HUD staleness restart + 20-test suite) 1/1 first-try at high effort (153k, 8.1m); code-feature signal-contract (all 3 scoreboard surfaces + canonical-route lint enforcement) passed on retry (358k, 13.7m) — attempt 1 died on stale old-column assertions in pre-existing tests it hadn't finished updating; the retry prompt's injected FAIL list was enough to close it out. Lesson: when a task rewrites a display contract, name every test file asserting the old contract in the spec's ownership list AND tell it to update them FIRST.
 - 2026-07-09 code-feature/code-fix (ringside-overhaul): 4/4 first-try — a ringer.py logging change with tests, a 265-line stdlib backfill CLI (atomic rewrite, dry-run, idempotence all check-verified), a ~1500-line single-file HTML redesign (running-now pills + worker-card grid + multi-expansion refactor, 30KB patch, node --check + contract greps + unittest), and a render-gating change where it correctly UPDATED tests asserting the old behavior instead of gaming the check. Medium/high reasoning, 65–120k tokens/task.
 - Same day, different session (bench-harness-patches, code-fix): 0.29 first-try over 7 tasks on a Next.js/Turbopack harness. Spec and check quality dominate model choice — see the scoreboard before generalizing either number.
+
+- 2026-08-29 — code-review (defcast-16-build-plan-review, ops/topology lens,
+  fishers, effort high): PASS first try, 95k tokens, 333s. Five findings, all
+  P1/P2, all orchestrator-confirmed — including the round's most consequential
+  (the cutover flow would re-swap a live timer owner). Citation format followed
+  the spec exactly this time (spec spelled out 'plain relative paths, no
+  markdown links' — the 2026-08-18 lesson applied, zero format failures).
 
 ## GPT-5.5 (codex) — attribution caveat
 - 2026-08-08 code-fix (claude-memory retire-monolith, worktree, high reasoning): PASS on attempt 2 of a wide 14-file refactor with a 300+-test executed check; attempt-1 failure was a check grep hitting a docstring mention, not a code defect — retry-with-check-output fixed it precisely. ~175k tokens total. Note: worker sandbox had no network, so it could not run `uvx pytest` itself; the executed check (outside the sandbox) carried verification. Spec the runner's availability next time or vendor pytest.
@@ -574,3 +592,14 @@ checks and raw logs support — no vibes, no worker self-reports.
   write as "ESCAPE_BLOCKED: Read-only file system", no file landed on the host.
   Followed a "this is expected to fail, do not retry or work around it"
   instruction exactly — good sign for a cheap smoke/probe lane.
+
+- 2026-08-29 — code-review (defcast-16-build-plan-review, grounding/fact-check
+  lens, fishers): **PASS first try, 43.7k tokens, 328s** — and the FIRST OpenCode
+  task under the bwrap backend on fishers (second Linux node validated). Verified
+  7 claim classes against the repo with line-level cites (function inventory,
+  a D1-D9 ratification table, queue scoping, pipeline premise, foot-gun numbers)
+  and produced 3 legitimate sequencing findings the two stronger reviewers'
+  lenses also implied. Spec design mattered: enumerated numbered checks with
+  explicit "grep, don't read whole files" guidance — squarely in flash-class
+  territory and it excelled. Grounding/fact-check review is now a proven-shaped
+  lane for this model; open-ended design review remains untested.
