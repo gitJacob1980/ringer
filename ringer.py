@@ -41,7 +41,7 @@ from html import escape as html_escape
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 
 TOOL_NAME = "ringer"
@@ -6994,6 +6994,137 @@ class ReadModelSyncResult:
     skipped: int
     offset: int
     rebuilt: bool
+    postgres_inserted: int = 0
+    postgres_source: str | None = None
+
+
+POSTGRES_ATTEMPT_COLUMNS = (
+    "run_id",
+    "pattern",
+    "task_key",
+    "spec",
+    "worker_engine",
+    "shepherd_model",
+    "verify_method",
+    "verdict",
+    "duration_ms",
+    "worker_tokens",
+    "notes",
+    "orchestrator",
+    "model",
+    "reported_model",
+    "expected_model",
+    "reasoning_effort",
+    "task_type",
+    "retry",
+)
+POSTGRES_SYNC_COLUMNS = ("id", "logged_at", *POSTGRES_ATTEMPT_COLUMNS, "payload")
+POSTGRES_SYNC_SOURCE = "Postgres swarm_runs"
+
+
+def connect_eval_postgres(config: PostgresEvalConfig) -> Any:
+    """Connect to the eval database without making psycopg a runtime dependency."""
+    try:
+        import psycopg  # type: ignore[import-not-found]
+        from psycopg.rows import dict_row  # type: ignore[import-not-found]
+    except Exception as exc:
+        raise RuntimeError(f"psycopg import failed: {exc}") from exc
+    creds = parse_env_file(config.env_file)
+    required = (
+        "SUPABASE_DB_HOST",
+        "SUPABASE_DB_PORT",
+        "SUPABASE_DB_USER",
+        "SUPABASE_DB_PASSWORD",
+        "SUPABASE_DB_NAME",
+    )
+    missing = [key for key in required if not creds.get(key)]
+    if missing:
+        raise RuntimeError(f"missing Supabase env keys: {', '.join(missing)}")
+    return psycopg.connect(
+        host=creds["SUPABASE_DB_HOST"],
+        port=int(creds["SUPABASE_DB_PORT"]),
+        user=creds["SUPABASE_DB_USER"],
+        password=creds["SUPABASE_DB_PASSWORD"],
+        dbname=creds["SUPABASE_DB_NAME"],
+        autocommit=True,
+        connect_timeout=5,
+        row_factory=dict_row,
+    )
+
+
+def postgres_attempt_row(record: Any) -> tuple[int, dict[str, Any]]:
+    if isinstance(record, Mapping):
+        values = record
+    else:
+        values = dict(zip(POSTGRES_SYNC_COLUMNS, record))
+    row_id = int(values["id"])
+    payload = values.get("payload")
+    if payload is not None:
+        if isinstance(payload, Mapping):
+            row = dict(payload)
+        else:
+            parsed = json.loads(payload)
+            if not isinstance(parsed, dict):
+                raise ValueError(f"Postgres payload for swarm_runs id {row_id} is not an object")
+            row = parsed
+    else:
+        row = {
+            key: values[key]
+            for key in POSTGRES_ATTEMPT_COLUMNS
+            if values.get(key) is not None
+        }
+    logged_at = values.get("logged_at")
+    if logged_at is None:
+        raise ValueError(f"Postgres swarm_runs id {row_id} has no logged_at value")
+    isoformat = getattr(logged_at, "isoformat", None)
+    row["logged_at"] = isoformat() if callable(isoformat) else str(logged_at)
+    return row_id, row
+
+
+def sync_postgres_attempt_rows(
+    conn: Any,
+    eval_config: EvalConfig | None,
+    *,
+    connection_factory: Callable[[PostgresEvalConfig], Any] | None = None,
+) -> tuple[int, str | None]:
+    if eval_config is None or eval_config.backend != "postgres":
+        return 0, None
+    if eval_config.postgres is None:
+        print("models: Postgres read-model sync skipped (postgres eval config missing)", file=sys.stderr)
+        return 0, None
+    factory = connection_factory or connect_eval_postgres
+    pg_conn: Any | None = None
+    try:
+        last_id = read_sync_state_int(conn, "pg_last_id", 0)
+        pg_conn = factory(eval_config.postgres)
+        cursor = pg_conn.execute(
+            """
+            SELECT id, logged_at,
+                   run_id, pattern, task_key, spec, worker_engine, shepherd_model,
+                   verify_method, verdict, duration_ms, worker_tokens, notes, orchestrator,
+                   model, reported_model, expected_model, reasoning_effort, task_type, retry,
+                   payload
+            FROM swarm_runs
+            WHERE id > %s
+            ORDER BY id
+            """,
+            (last_id,),
+        )
+        records = cursor.fetchall() if hasattr(cursor, "fetchall") else list(cursor)
+        converted = [postgres_attempt_row(record) for record in records]
+    except Exception as exc:
+        note = re.sub(r"\s+", " ", str(exc)).strip()
+        print(f"models: Postgres read-model sync skipped ({note})", file=sys.stderr)
+        return 0, None
+    finally:
+        if pg_conn is not None:
+            with contextlib.suppress(Exception):
+                pg_conn.close()
+    rows = [row for _row_id, row in converted]
+    inserted = insert_attempt_rows(conn, rows)
+    new_last_id = max((row_id for row_id, _row in converted), default=last_id)
+    write_sync_state_values(conn, {"pg_last_id": new_last_id})
+    return inserted, POSTGRES_SYNC_SOURCE
 
 
 def rebuild_read_model_db(
@@ -7002,6 +7133,8 @@ def rebuild_read_model_db(
     *,
     catalog_path: Path | None = None,
     registry_path: Path | None = None,
+    eval_config: EvalConfig | None = None,
+    postgres_connection_factory: Callable[[PostgresEvalConfig], Any] | None = None,
 ) -> ReadModelSyncResult:
     db_path = db_path.expanduser().resolve()
     log_path = log_path.expanduser().resolve()
@@ -7014,6 +7147,12 @@ def rebuild_read_model_db(
             create_read_model_schema(conn)
             rows, skipped, offset = read_log_rows_from_offset(log_path, 0)
             inserted = insert_attempt_rows(conn, rows)
+            postgres_inserted, postgres_source = sync_postgres_attempt_rows(
+                conn,
+                eval_config,
+                connection_factory=postgres_connection_factory,
+            )
+            inserted += postgres_inserted
             refresh_catalog_tables(conn, catalog_path)
             refresh_identity_tables(conn, registry_path)
             write_sync_state_values(conn, {"log_offset": offset})
@@ -7021,7 +7160,16 @@ def rebuild_read_model_db(
         except Exception:
             conn.rollback()
             raise
-    return ReadModelSyncResult(db_path, log_path, inserted, skipped, offset, True)
+    return ReadModelSyncResult(
+        db_path,
+        log_path,
+        inserted,
+        skipped,
+        offset,
+        True,
+        postgres_inserted,
+        postgres_source,
+    )
 
 
 def sync_read_model_db(
@@ -7030,6 +7178,8 @@ def sync_read_model_db(
     *,
     catalog_path: Path | None = None,
     registry_path: Path | None = None,
+    eval_config: EvalConfig | None = None,
+    postgres_connection_factory: Callable[[PostgresEvalConfig], Any] | None = None,
 ) -> ReadModelSyncResult:
     db_path = db_path.expanduser().resolve()
     log_path = log_path.expanduser().resolve()
@@ -7051,9 +7201,17 @@ def sync_read_model_db(
                     log_path,
                     catalog_path=catalog_path,
                     registry_path=registry_path,
+                    eval_config=eval_config,
+                    postgres_connection_factory=postgres_connection_factory,
                 )
             rows, skipped, new_offset = read_log_rows_from_offset(log_path, offset)
             inserted = insert_attempt_rows(conn, rows)
+            postgres_inserted, postgres_source = sync_postgres_attempt_rows(
+                conn,
+                eval_config,
+                connection_factory=postgres_connection_factory,
+            )
+            inserted += postgres_inserted
             refresh_catalog_tables(conn, catalog_path)
             refresh_identity_tables(conn, registry_path)
             write_sync_state_values(conn, {"log_offset": new_offset})
@@ -7061,7 +7219,16 @@ def sync_read_model_db(
         except Exception:
             conn.rollback()
             raise
-    return ReadModelSyncResult(db_path, log_path, inserted, skipped, new_offset, False)
+    return ReadModelSyncResult(
+        db_path,
+        log_path,
+        inserted,
+        skipped,
+        new_offset,
+        False,
+        postgres_inserted,
+        postgres_source,
+    )
 
 
 def load_identity_registry_from_db(conn: Any) -> ModelIdentityRegistry:
@@ -8392,8 +8559,19 @@ def write_model_scoreboard_html(
     return target
 
 
-def print_model_log_table(path: Path, rows_read: int, skipped: int, groups: list[dict[str, Any]]) -> None:
-    print(f"Model log: {path} ({rows_read} rows, {skipped} skipped lines)")
+def print_model_log_table(
+    path: Path,
+    rows_read: int,
+    skipped: int,
+    groups: list[dict[str, Any]],
+    *,
+    postgres_source: str | None = None,
+    postgres_inserted: int = 0,
+) -> None:
+    source_note = (
+        f"; {postgres_source} ({postgres_inserted} new rows)" if postgres_source else ""
+    )
+    print(f"Model log: {path} ({rows_read} rows, {skipped} skipped lines){source_note}")
     widths = (32, 20, 18, 18, 10, 7, 10, 7, 15, 14, 14, 60)
     header = " | ".join(
         f"{name:<{width}}" for name, width in zip(MODEL_SCOREBOARD_COLUMNS, widths)
@@ -8524,7 +8702,12 @@ def build_models_api_payload(
     }
 
 
-def run_models_command(config: AppConfig, args: argparse.Namespace) -> int:
+def run_models_command(
+    config: AppConfig,
+    args: argparse.Namespace,
+    *,
+    postgres_connection_factory: Callable[[PostgresEvalConfig], Any] | None = None,
+) -> int:
     default_log_path = config.eval.jsonl_path.expanduser().resolve()
     log_path = (args.log or default_log_path).expanduser().resolve()
     since = validate_since_date(args.since)
@@ -8539,6 +8722,8 @@ def run_models_command(config: AppConfig, args: argparse.Namespace) -> int:
         explicit_db=explicit_db,
     )
     catalog_events: list[dict[str, Any]] | None = None
+    postgres_source: str | None = None
+    postgres_inserted = 0
     if using_db:
         try:
             sync_result = sync_read_model_db(
@@ -8546,7 +8731,11 @@ def run_models_command(config: AppConfig, args: argparse.Namespace) -> int:
                 log_path,
                 catalog_path=catalog_path,
                 registry_path=registry_path,
+                eval_config=config.eval if log_path == default_log_path else None,
+                postgres_connection_factory=postgres_connection_factory,
             )
+            postgres_source = sync_result.postgres_source
+            postgres_inserted = sync_result.postgres_inserted
             rows, identity_registry = db_attempt_rows(db_path, since=since, engine=args.engine)
             disk_registry = load_model_identity_registry(registry_path)
             identity_registry = dataclass_replace(
@@ -8624,7 +8813,14 @@ def run_models_command(config: AppConfig, args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(groups))
     else:
-        print_model_log_table(log_path, len(rows), skipped, groups)
+        print_model_log_table(
+            log_path,
+            len(rows),
+            skipped,
+            groups,
+            postgres_source=postgres_source,
+            postgres_inserted=postgres_inserted,
+        )
     return 0
 
 

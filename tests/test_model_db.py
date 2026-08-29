@@ -10,6 +10,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,8 +21,10 @@ from ringer import (  # noqa: E402
     AppConfig,
     ArtifactConfig,
     EvalConfig,
+    PostgresEvalConfig,
     connect_read_model_db,
     create_read_model_schema,
+    db_attempt_rows,
     humanized_log_date,
     load_model_identity_registry,
     rebuild_read_model_db,
@@ -131,7 +134,7 @@ class ModelDbTests(unittest.TestCase):
         os.environ.clear()
         os.environ.update(self.old_env)
 
-    def config(self) -> AppConfig:
+    def config(self, eval_config: EvalConfig | None = None) -> AppConfig:
         return AppConfig(
             path=None,
             identity_default=None,
@@ -140,7 +143,7 @@ class ModelDbTests(unittest.TestCase):
             hud_port=8700,
             hud_app_path=None,
             allow_full_access=False,
-            eval=EvalConfig(backend="jsonl", jsonl_path=self.log_path),
+            eval=eval_config or EvalConfig(backend="jsonl", jsonl_path=self.log_path),
             engines={},
             artifact=ArtifactConfig(
                 enabled=False,
@@ -170,6 +173,13 @@ class ModelDbTests(unittest.TestCase):
     def count_attempts(self) -> int:
         with sqlite3.connect(self.db_path) as conn:
             return int(conn.execute("SELECT COUNT(*) FROM attempts").fetchone()[0])
+
+    def postgres_eval_config(self) -> EvalConfig:
+        return EvalConfig(
+            backend="postgres",
+            jsonl_path=self.log_path,
+            postgres=PostgresEvalConfig(env_file=self.root / "postgres.env"),
+        )
 
     def test_schema_creation_uses_wal_mode(self) -> None:
         with contextlib.closing(connect_read_model_db(self.db_path)) as conn:
@@ -286,6 +296,171 @@ class ModelDbTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM attempts WHERE run_id = 'run-2'"
             ).fetchone()[0]
         self.assertEqual(1, run_2_count)
+
+    def test_postgres_sync_ingests_payload_and_legacy_rows_with_id_watermark(self) -> None:
+        payload = attempt(
+            run_id="pg-payload",
+            model="openrouter/payload-model",
+            task_type="code-review",
+            retry=True,
+        )
+        payload.pop("logged_at")
+        records = [
+            {
+                "id": 1,
+                "logged_at": datetime(2026, 7, 7, 12, 30, tzinfo=timezone.utc),
+                "payload": json.dumps(payload),
+            },
+            {
+                "id": 2,
+                "logged_at": datetime(2026, 7, 8, 9, 15, tzinfo=timezone.utc),
+                "run_id": "pg-legacy",
+                "task_key": "legacy-task",
+                "worker_engine": "opencode",
+                "verdict": "PASS",
+                "duration_ms": 321,
+                "worker_tokens": 654,
+                "notes": "legacy",
+                "orchestrator": "tester",
+                "payload": None,
+            },
+        ]
+        watermarks: list[int] = []
+
+        class FakeCursor:
+            def __init__(self, rows: list[dict[str, object]]) -> None:
+                self.rows = rows
+
+            def fetchall(self) -> list[dict[str, object]]:
+                return self.rows
+
+        class FakeConnection:
+            def execute(self, sql: str, params: tuple[int]) -> FakeCursor:
+                self.assert_query(sql)
+                watermark = int(params[0])
+                watermarks.append(watermark)
+                return FakeCursor([row for row in records if int(row["id"]) > watermark])
+
+            def assert_query(self, sql: str) -> None:
+                test_case.assertIn("FROM swarm_runs", sql)
+                test_case.assertIn("WHERE id > %s", sql)
+                test_case.assertIn("ORDER BY id", sql)
+
+            def close(self) -> None:
+                pass
+
+        test_case = self
+
+        def connect(_config: PostgresEvalConfig) -> FakeConnection:
+            return FakeConnection()
+
+        first = sync_read_model_db(
+            self.db_path,
+            self.log_path,
+            catalog_path=self.catalog_path,
+            registry_path=self.registry_path,
+            eval_config=self.postgres_eval_config(),
+            postgres_connection_factory=connect,
+        )
+        rows, _registry = db_attempt_rows(self.db_path)
+
+        self.assertEqual(2, first.attempts_inserted)
+        self.assertEqual(2, first.postgres_inserted)
+        self.assertEqual("Postgres swarm_runs", first.postgres_source)
+        self.assertEqual(
+            (
+                "openrouter/payload-model",
+                "code-review",
+                True,
+                "2026-07-07T12:30:00+00:00",
+            ),
+            (
+                rows[0]["model"],
+                rows[0]["task_type"],
+                rows[0]["retry"],
+                rows[0]["logged_at"],
+            ),
+        )
+        self.assertEqual(
+            ("pg-legacy", "legacy-task", "opencode", "PASS", "2026-07-08T09:15:00+00:00"),
+            (
+                rows[1]["run_id"],
+                rows[1]["task_key"],
+                rows[1]["worker_engine"],
+                rows[1]["verdict"],
+                rows[1]["logged_at"],
+            ),
+        )
+
+        second = sync_read_model_db(
+            self.db_path,
+            self.log_path,
+            catalog_path=self.catalog_path,
+            registry_path=self.registry_path,
+            eval_config=self.postgres_eval_config(),
+            postgres_connection_factory=connect,
+        )
+        self.assertEqual(0, second.attempts_inserted)
+        self.assertEqual(0, second.postgres_inserted)
+        self.assertEqual(2, self.count_attempts())
+        self.assertEqual([0, 2], watermarks)
+
+        rebuilt = rebuild_read_model_db(
+            self.db_path,
+            self.log_path,
+            catalog_path=self.catalog_path,
+            registry_path=self.registry_path,
+            eval_config=self.postgres_eval_config(),
+            postgres_connection_factory=connect,
+        )
+        self.assertTrue(rebuilt.rebuilt)
+        self.assertEqual(2, rebuilt.postgres_inserted)
+        self.assertEqual(2, self.count_attempts())
+        self.assertEqual(0, watermarks[-1])
+
+        args = self.model_args()
+        args.json = False
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(
+                0,
+                run_models_command(
+                    self.config(self.postgres_eval_config()),
+                    args,
+                    postgres_connection_factory=connect,
+                ),
+            )
+        self.assertTrue(
+            out.getvalue().startswith(
+                f"Model log: {self.log_path} (2 rows, 0 skipped lines); "
+                "Postgres swarm_runs (0 new rows)\n"
+            )
+        )
+
+    def test_postgres_connect_failure_keeps_jsonl_models_result(self) -> None:
+        write_jsonl(self.log_path, [attempt(run_id="jsonl-run")])
+
+        def fail_connect(_config: PostgresEvalConfig) -> object:
+            raise RuntimeError("database unavailable")
+
+        out = io.StringIO()
+        err = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            result = run_models_command(
+                self.config(self.postgres_eval_config()),
+                self.model_args(),
+                postgres_connection_factory=fail_connect,
+            )
+
+        payload = json.loads(out.getvalue())
+        self.assertEqual(0, result)
+        self.assertEqual(1, len(payload))
+        self.assertEqual("openrouter/z-ai/glm-5.2", payload[0]["model"])
+        self.assertEqual(1, self.count_attempts())
+        self.assertEqual(
+            "models: Postgres read-model sync skipped (database unavailable)\n",
+            err.getvalue(),
+        )
 
     def test_catalog_sync_skips_unchanged_files_and_appends_new_events_only(self) -> None:
         changes_path = ringer.catalog_changes_path(self.catalog_path)
@@ -471,8 +646,18 @@ class ModelDbTests(unittest.TestCase):
         out = io.StringIO()
         err = io.StringIO()
 
+        def unexpected_postgres_connect(_config: PostgresEvalConfig) -> object:
+            raise AssertionError("explicit --log must not sync Postgres")
+
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            self.assertEqual(0, run_models_command(self.config(), args))
+            self.assertEqual(
+                0,
+                run_models_command(
+                    self.config(self.postgres_eval_config()),
+                    args,
+                    postgres_connection_factory=unexpected_postgres_connect,
+                ),
+            )
 
         payload = json.loads(out.getvalue())
         self.assertEqual(1, len(payload))
