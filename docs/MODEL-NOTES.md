@@ -544,3 +544,33 @@ checks and raw logs support — no vibes, no worker self-reports.
   zero output produced. Availability failure, not capability — no capability signal gained.
   Don't count against the model, but treat the free endpoint as flaky; re-audition later with
   a fallback planned.
+
+## glm-5.3-flash via opencode (`openrouter/z-ai/glm-5.3-flash`)
+
+- 2026-08-28 — code-feature (rfraz-svc-01-platform-scaffold, monitoring lane,
+  2 attempts, 0 tokens): **both FAIL rows are HARNESS failures, not model
+  evidence.** `engines/opencode-sandboxed.sh` is macOS-only (needs
+  `/usr/bin/sandbox-exec`); on this Linux node it exits 1 before spawning
+  OpenCode, so the model was never called. Do not count these against the
+  model. Fix options: give the wrapper a Linux path (`bwrap` is installed on
+  this node) or run opencode tasks with `full_access: true` here. Also note the
+  sandbox (when it works) confines writes to the TASKDIR — a repo-feature lane
+  that must edit a repo outside the taskdir needs full_access or a
+  deliver-to-taskdir + check-copies-in design, on any platform.
+- 2026-08-28 — code-feature (rfraz-svc-01-platform-scaffold, monitoring lane,
+  rerun with full_access on Linux): **PASS first try, 47k tokens, ~4 min.**
+  Three files (Netdata conf, a 200-line parameterised az-CLI bash script, a
+  README) — shellcheck-clean, DRY_RUN design done right, no stray writes
+  outside its owned paths despite no OS sandbox. Explicitly flagged its two
+  uncertain Azure facts as ASSUMPTIONS, and both turned out wrong on doc
+  check (a non-existent platform metric; a non-existent CLI flag) — so: trust
+  its flags, verify them, and don't treat cloud API specifics from it as fact.
+  One small logic slip (a `${VAR:+...}` on an always-set var). Strong candidate
+  for probation → proven on config/scripting lanes at ~1/20th of GLM 5.2's
+  price. Also fixed the earlier two FAIL rows' attribution: harness, not model.
+- 2026-08-28 — probe (opencode-bwrap-sandbox-probe): first OpenCode task under
+  the new Linux bwrap backend of engines/opencode-sandboxed.sh. PASS first try,
+  8.5k tokens, 48s. Wrote in its taskdir, reported the deliberate out-of-sandbox
+  write as "ESCAPE_BLOCKED: Read-only file system", no file landed on the host.
+  Followed a "this is expected to fail, do not retry or work around it"
+  instruction exactly — good sign for a cheap smoke/probe lane.
