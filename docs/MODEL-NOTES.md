@@ -531,3 +531,16 @@ checks and raw logs support — no vibes, no worker self-reports.
 - **codex (effort default)**: code-fix 3 runs — build attempt FAILED only because the orchestrator tightened the check mid-run (leading spec); clean re-run first-try PASS (89k, 7.4m); review-fixes first-try PASS (125k, 7.6m). Robust when the spec carries exact numbers and file-anchored causes.
 - **codex (effort high)**: code-review panel — invariants lens first-try PASS (156k), css lens PASS attempt 2 (186k; attempt 1 failed the check on citation format again — same codex habit as 08-18: cites the patch it was pointed at, add path-style guidance to review specs). Both lenses converged independently on the same two HIGH geometry findings — panel worked.
 - **opencode/GLM**: 0.0s spawn failure ×2 — REPEAT of the 2026-08-12 note (opencode-sandboxed.sh is macOS Seatbelt-only; this is the Debian box). Orchestrator repeated the mistake by not re-reading these notes before engine assignment. Rule stands: no opencode lanes on Debian until the wrapper grows a bwrap path.
+## codex (addendum)
+- 2026-08-11 docfoundry review round 12 (code-fix): scoreboard shows FAIL/2-attempts but the WORKER WAS CORRECT both times — orchestrator check bug (`cd -` returned to doctools/ instead of the task dir after an inserted repo cd, so `test -s notes.md` looked in the wrong place). Work verified good by hand: 226/226 + real-corpus acceptance. Don't count this FAIL against codex; lesson: anchor TASKDIR="$(pwd)" at check start instead of relying on `cd -`.
+
+## 2026-08-16 — engagement-checklist-build (champagne-workflows)
+- **GLM 5.2** (docs, seed-JSON authoring): first-try PASS on structured JSON authoring vs a strict executed validator (23k tokens, 76s) — good at verbatim-content transcription tasks with a tight check. But on the repo-docs round it FAILED environmentally: **opencode engine on this Mac cannot write outside its scratch (macOS TCC)** — it staged deliverables in an EPHEMERAL ringer scratch dir (gone before integration) and self-patched the check to claim PASS. Lesson: repo-edit tasks route to codex (writable_roots) or the check must export deliverables to a durable path; never accept a worker-patched check.
+- **Codex/GPT-5.5** (code-feature ×2, docs ×1): 3/3 first-try PASS incl. the docs re-run (130k tokens, 519s) writing 5 repo files against a 25-assertion grep/compile check. writable_roots engine_args works for direct repo edits.
+
+## nvidia/nemotron-3.5-lightning:free
+- 2026-08-22 (code-feature, rfr-soak-sprint overlap-inventory audition): FAIL x2 — OpenRouter
+  server errors ("Unexpected server error", refs err_04b9eb89/err_732517de) on BOTH attempts;
+  zero output produced. Availability failure, not capability — no capability signal gained.
+  Don't count against the model, but treat the free endpoint as flaky; re-audition later with
+  a fallback planned.
