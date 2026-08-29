@@ -222,6 +222,13 @@ checks and raw logs support — no vibes, no worker self-reports.
   defect others framed past (#33 was also its find, 2026-08-03). Raw JSON
   'thought' stream shows messy interim drafts; the final report.md was clean
   and evidence-dense. Keep grok-4.5 on lock/interleaving review lanes.
+- 2026-08-29 — code-review (defcast-16-build code lane, fishers): PASS first
+  try, 992k tokens (heavy cache reads), 573s, ~$0.29-class metered. Four
+  findings, all orchestrator-confirmed incl. the round's best: prod
+  Update-DefcastRowIfMatch returns nothing, so the reviewed code's success
+  branch was dead AND its tests pinned the unreachable branch. Also correctly
+  cleared 4 checked-no-finding areas with citations. Token-hungry but keeps
+  paying for itself on lock/claim semantics.
 
 ## grok-build (Grok CLI engine, flat plan)
 
@@ -377,6 +384,14 @@ checks and raw logs support — no vibes, no worker self-reports.
   (the cutover flow would re-swap a live timer owner). Citation format followed
   the spec exactly this time (spec spelled out 'plain relative paths, no
   markdown links' — the 2026-08-18 lesson applied, zero format failures).
+- 2026-08-29 — code-feature x2 + code-fix (defcast-16-build, fishers, high +
+  medium effort): all PASS first try. PR-B (high): module + 6 call sites +
+  claim rework + 13 tests + doc section; went beyond spec to fix a latent
+  lost-claim bug and to add a behavioral six-script wiring test. PR-C
+  (medium): surgical, exactly-scoped. Fix round (high): applied 5 confirmed
+  review findings incl. a marker-file mechanism spanning pipeline+module+
+  tests+docs, with defensible judgment calls written up unprompted
+  (unreadable marker fails closed). 787/787 suite after.
 
 ## GPT-5.5 (codex) — attribution caveat
 - 2026-08-08 code-fix (claude-memory retire-monolith, worktree, high reasoning): PASS on attempt 2 of a wide 14-file refactor with a 300+-test executed check; attempt-1 failure was a check grep hitting a docstring mention, not a code defect — retry-with-check-output fixed it precisely. ~175k tokens total. Note: worker sandbox had no network, so it could not run `uvx pytest` itself; the executed check (outside the sandbox) carried verification. Spec the runner's availability next time or vendor pytest.
@@ -603,3 +618,15 @@ checks and raw logs support — no vibes, no worker self-reports.
   explicit "grep, don't read whole files" guidance — squarely in flash-class
   territory and it excelled. Grounding/fact-check review is now a proven-shaped
   lane for this model; open-ended design review remains untested.
+- 2026-08-29 — code-feature (defcast-16-build pr-a, fishers): PASS first try,
+  47.6k tokens, 518s — packaging scripts (2 pwsh files + pipeline YAML wiring)
+  with an executed check incl. a negative test. Respected a repo foot-gun list
+  and adapted to the bwrap sandbox unprompted (staged under OutDir instead of
+  /tmp). Second clean code-feature; config/scripting lane looks proven-bound.
+- 2026-08-29 — code-review (defcast-16-build compliance lane, fishers): PASS
+  first try, 73.6k tokens, 570s. 7-point checklist compliance review of a
+  3-commit diff; caught a REAL P2 the orchestrator's own build brief had
+  dropped from the ratified plan (jobs-artifact unset-role rule) — a
+  divergence neither the author lane nor the concurrency reviewer surfaced.
+  Checklist-style compliance review is now this model's strongest defcast
+  lane; keep specs enumerated and grep-guided.
