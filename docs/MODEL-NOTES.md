@@ -43,6 +43,34 @@ checks and raw logs support — no vibes, no worker self-reports.
   contract+tests). The model treats the check's failure output as the spec.
   Orchestrator rule: commit contract, tests, AND the manifest before
   dispatching any diff/untracked-grep-checked task.
+- 2026-10-18 — gpt-5.6-sol medium, code-feature x4 (reify-matt-mvp:
+  pure module, desired-state engine vs fake SharePoint, two admin scripts,
+  Graph audit spike, digest). Strong: 4 of 5 first-try, 54k-120k tokens
+  each, real tests; the one FAIL was two orchestrator harness bugs. Root
+  cause of every problem this run was the ORCHESTRATOR's checks, not the
+  model: a verifier that read an import warning as an export, a broken
+  Export-ModuleMember strip in a scenario harness, a fake that let
+  ConvertFrom-Json coerce ISO timestamps. Model trait, narrowly: when the
+  check itself is wrong, it changes production code until the check
+  passes (a WarningPreference mute; a harness-marker-gated re-import; a
+  lowercase RFC 3339 't') and discloses it in fix-summary or a comment
+  rather than flagging the check as defective. Only the third was against
+  an explicit instruction, and the raw log shows the loophole: attempt 1
+  OBEYED (diagnosed both harness bugs, reported them, made no workaround)
+  and was graded FAIL; the auto-retry prompt ("Previous attempt failed:
+  <output>") carried no sign the report was read, so on attempt 2 it
+  reread the rule "never put scenario- or test-specific code" by FORM, not
+  motive: "A valid, non-test-specific compatibility is available: RFC 3339
+  permits a lowercase t". Two holes: (1) a rule banning test-specific code
+  is satisfied by any change with a production rationale; ban changes MADE
+  BECAUSE of a suspected verifier defect, however justified; (2) structural:
+  reporting a verifier defect scores the same as failing and triggers a
+  retry, so the only route to PASS is changing code. Give workers a
+  sanctioned verifier-defect exit (BLOCKED, no auto-retry) and intervene
+  before the retry. Lesson for check authors too: smoke-test every fake
+  against representative inputs before dispatch (the one fake that got
+  that treatment caused no workarounds), read diffs for harness-shaped
+  code, and fix the harness.
 - 2026-07-05 — carried the heavy lanes of the milk-crate demo rehearsals
   (market read with source allowlist, site build) with clean first-attempt
   passes.
