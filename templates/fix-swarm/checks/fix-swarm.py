@@ -137,6 +137,9 @@ def main() -> int:
 
     if not args.summary.is_absolute() and args.summary.exists():
         run_git(["reset", "--quiet", "--", str(args.summary)])
+    verifier_defect = Path("VERIFIER-DEFECT.md")
+    if verifier_defect.exists():
+        run_git(["reset", "--quiet", "--", str(verifier_defect)])
 
     names_result = run_git(["diff", "--cached", "--name-only", "-z"])
     changed_files = [item for item in names_result.stdout.split("\0") if item]

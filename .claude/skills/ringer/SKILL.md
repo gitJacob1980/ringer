@@ -156,6 +156,13 @@ the check's failure output.
 - **Checks must print WHY they fail.** `diff` beats `diff -q`; a validator
   script that prints which assertion broke beats `test -f`. A bare
   `test -f report.md` proves existence, not correctness.
+- **Opt in new or hand-written checks to verifier-defect review.** Set
+  `allow_verifier_defect: true` on those tasks (or at run level) so a worker
+  can leave a structured `VERIFIER-DEFECT.md` instead of changing good work
+  to appease a broken assertion. BLOCKED is not success: read the marker,
+  reproduce the claim (for example with `ringer.py baseline` or by running
+  the check by hand), fix the check if the claim holds, then re-run. Never
+  accept BLOCKED as success.
 - **Verify content, not existence.** Grep the artifact for required sections,
   run the code it produced, run the build, run the validator — execute
   something that would catch a lazy or hallucinated result.

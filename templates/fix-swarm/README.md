@@ -31,6 +31,8 @@ Use it after the orchestrator has already decided what should be fixed. It is a 
 
 The manifest invokes `checks/fix-swarm.py`. The validator runs the filled build/test command, validates `fix-summary.md`, stages the worktree, rejects patches that touch files outside the ownership list, and writes a non-empty patch plus summary into the run workdir.
 
+Opt in with `allow_verifier_defect` for new or hand-written checks; the validator keeps `VERIFIER-DEFECT.md` out of exported patches and ownership checks.
+
 `expect_files` is intentionally empty because worktrees mode deletes passing task worktrees. The durable deliverables are check-produced files at the filled patch and summary paths in `WORKDIR`; review those before applying anything.
 
 ## Mix with

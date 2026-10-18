@@ -94,7 +94,8 @@
     if (run.state === "died") return `${name} · died`;
     const pass = numberOrZero(run.pass ?? run.summary?.pass ?? run.totals?.pass);
     const fail = numberOrZero(run.fail ?? run.summary?.fail ?? run.totals?.fail);
-    return `${name} · ok ${pass} fail ${fail}`;
+    const blocked = numberOrZero(run.blocked ?? run.summary?.blocked ?? run.totals?.blocked);
+    return `${name} · ok ${pass} fail ${fail} blocked ${blocked}`;
   }
 
   function newestRun(runs) {

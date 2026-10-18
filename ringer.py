@@ -53,6 +53,16 @@ CONFIG_FILE_NAME = "config.toml"
 DEFAULT_ENGINE_NAME = "codex"
 DEFAULT_TIMEOUT_S = 900
 CHECK_TIMEOUT_S = 60
+VERIFIER_DEFECT_MAX_BYTES = 8 * 1024
+VERIFIER_DEFECT_FILENAME = "VERIFIER-DEFECT.md"
+VERIFIER_DEFECT_FOOTER = (
+    "VERIFIER DEFECTS: if you conclude that the check itself is wrong (not your work), "
+    "do not change your work to get past it, however well you can justify the change on "
+    "other grounds. Instead write VERIFIER-DEFECT.md in your working directory with three "
+    "lines: 'Check assertion: <which assertion or scenario>', 'Why it is wrong: <the defect "
+    "in the check>', 'Evidence: <what you observed>'. If the check then fails, the task ends "
+    "BLOCKED for the orchestrator to review, with no retry. A passing check always wins."
+)
 DEFAULT_DASHBOARD_PORT_BASE = 8787
 DEFAULT_HUD_PORT = 8700
 DEFAULT_CATALOG_SOURCE = "https://openrouter.ai/api/v1/models"
@@ -1642,6 +1652,7 @@ class TaskSpec:
     # engine's {model} placeholder); empty means the engine's model_default.
     model: str = ""
     task_type: str = ""
+    allow_verifier_defect: bool = False
 
     @classmethod
     def from_obj(cls, obj: dict[str, Any]) -> "TaskSpec":
@@ -1708,6 +1719,9 @@ class TaskSpec:
             verified=verified.strip(),
             model=model.strip(),
             task_type=task_type.strip(),
+            allow_verifier_defect=require_bool(
+                obj.get("allow_verifier_defect", False), key, "allow_verifier_defect"
+            ),
         )
 
 
@@ -1719,6 +1733,7 @@ class Manifest:
     worktrees: bool
     repo: Path | None
     tasks: tuple[TaskSpec, ...]
+    allow_verifier_defect: bool = False
     source_path: Path | None = None
 
     @classmethod
@@ -1734,6 +1749,7 @@ class Manifest:
             worktrees=manifest.worktrees,
             repo=manifest.repo,
             tasks=manifest.tasks,
+            allow_verifier_defect=manifest.allow_verifier_defect,
             source_path=path,
         )
 
@@ -1756,7 +1772,17 @@ class Manifest:
         tasks_raw = obj.get("tasks")
         if not isinstance(tasks_raw, list) or not tasks_raw:
             raise ValueError("tasks must be a non-empty list")
-        tasks = tuple(TaskSpec.from_obj(task) for task in tasks_raw)
+        run_allow_verifier_defect = require_bool(
+            obj.get("allow_verifier_defect", False), "manifest", "allow_verifier_defect"
+        )
+        tasks_list: list[TaskSpec] = []
+        for task_obj in tasks_raw:
+            if not isinstance(task_obj, dict):
+                raise ValueError("each task must be an object")
+            inherited = dict(task_obj)
+            inherited.setdefault("allow_verifier_defect", run_allow_verifier_defect)
+            tasks_list.append(TaskSpec.from_obj(inherited))
+        tasks = tuple(tasks_list)
         keys = [task.key for task in tasks]
         duplicates = sorted({key for key in keys if keys.count(key) > 1})
         if duplicates:
@@ -1781,6 +1807,7 @@ class Manifest:
             worktrees=worktrees,
             repo=repo,
             tasks=tasks,
+            allow_verifier_defect=run_allow_verifier_defect,
         )
 
     def with_max_parallel(self, value: int | None) -> "Manifest":
@@ -1795,6 +1822,7 @@ class Manifest:
             worktrees=self.worktrees,
             repo=self.repo,
             tasks=self.tasks,
+            allow_verifier_defect=self.allow_verifier_defect,
             source_path=self.source_path,
         )
 
@@ -2094,6 +2122,8 @@ class TaskRuntime:
     setup_error: str | None = None
     last_worker_command: list[str] = field(default_factory=list)
     steering: dict[str, Any] | None = None
+    verifier_defect_path: Path | None = None
+    verifier_defect_excerpt: str = ""
 
     def elapsed_s(self, now: float) -> float:
         if self.started_at_monotonic is None:
@@ -2118,6 +2148,40 @@ class VerifyResult:
     check_timed_out: bool
     raw_output_excerpt: str
     missing_files: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class VerifierDefectMarker:
+    exists: bool = False
+    valid: bool = False
+    text: str = ""
+    note: str = ""
+
+
+def read_verifier_defect_marker(taskdir: Path) -> VerifierDefectMarker:
+    path = taskdir / VERIFIER_DEFECT_FILENAME
+    try:
+        with path.open("rb") as fh:
+            raw = fh.read(VERIFIER_DEFECT_MAX_BYTES + 1)
+    except FileNotFoundError:
+        return VerifierDefectMarker()
+    except OSError as exc:
+        return VerifierDefectMarker(exists=True, note=f"could not read marker: {exc}")
+    truncated = len(raw) > VERIFIER_DEFECT_MAX_BYTES
+    text = raw[:VERIFIER_DEFECT_MAX_BYTES].decode("utf-8", errors="replace")
+    required = ("Check assertion", "Why it is wrong", "Evidence")
+    values: dict[str, str] = {}
+    for line in text.splitlines():
+        match = re.match(r"^(Check assertion|Why it is wrong|Evidence):\s*(.*?)\s*$", line, re.IGNORECASE)
+        if match and match.group(2):
+            values[match.group(1).lower()] = match.group(2)
+    valid = all(field.lower() in values for field in required)
+    note = "valid marker"
+    if not valid:
+        note = "invalid marker (all three named fields require non-empty values)"
+    if truncated:
+        note += f"; excerpt capped at {VERIFIER_DEFECT_MAX_BYTES} bytes"
+    return VerifierDefectMarker(exists=True, valid=valid, text=text, note=note)
 
 
 class ProcessTree:
@@ -2316,19 +2380,24 @@ class StateWriter:
                     "log_tail": log_tail,
                     "log_tail_full": log_tail_full,
                 }
+                if runtime.verifier_defect_path is not None:
+                    task_state["verifier_defect_path"] = str(runtime.verifier_defect_path)
+                    task_state["verifier_defect_excerpt"] = runtime.verifier_defect_excerpt
                 if runtime.steering is not None:
                     task_state["steering"] = dict(runtime.steering)
                 tasks.append(task_state)
             pass_count = sum(1 for item in tasks if item["status"] == "pass")
             fail_count = sum(1 for item in tasks if item["status"] == "fail")
+            blocked_count = sum(1 for item in tasks if item["status"] == "blocked")
             running_count = sum(
                 1 for item in tasks if item["status"] in {"running", "verifying", "retrying"}
             )
             totals = {
                 "running": running_count,
-                "done": pass_count + fail_count,
+                "done": pass_count + fail_count + blocked_count,
                 "pass": pass_count,
                 "fail": fail_count,
+                "blocked": blocked_count,
                 "tokens": sum(int(item["tokens"] or 0) for item in tasks),
             }
             return {
@@ -2348,6 +2417,7 @@ class StateWriter:
                 "totals": totals,
                 "pass": totals["pass"],
                 "fail": totals["fail"],
+                "blocked": totals["blocked"],
                 "tokens": totals["tokens"],
                 "artifact_path": str(self.artifact_path) if self.artifact.enabled else None,
                 "live_path": str(self.live_path) if self.artifact.enabled else None,
@@ -2360,6 +2430,7 @@ class StateWriter:
             return {
                 "pass": sum(1 for runtime in self.runtimes if runtime.status == "pass"),
                 "fail": sum(1 for runtime in self.runtimes if runtime.status == "fail"),
+                "blocked": sum(1 for runtime in self.runtimes if runtime.status == "blocked"),
                 "tokens": sum(int(runtime.tokens or 0) for runtime in self.runtimes),
             }
 
@@ -2446,6 +2517,7 @@ class StateWriter:
                 report_path=self.report_path if self.report_path != self.version_path else None,
                 tasks_pass=int(totals.get("pass", state.get("pass", 0)) or 0),
                 tasks_fail=int(totals.get("fail", state.get("fail", 0)) or 0),
+                tasks_blocked=int(totals.get("blocked", state.get("blocked", 0)) or 0),
                 deliverables=collect_state_deliverables(state),
             )
             self.version_recorded = True
@@ -3085,6 +3157,7 @@ def print_model_explore(
         print(
             f"  {label:<9} {display} "
             f"task_type={group['task_type']} tasks={group['tasks']} "
+            f"blocked={group.get('blocked', 0)} block={group.get('block_rate', 0.0):.2f} "
             f"first={group['first_try_pass_rate']:.2f} pass={group['pass_rate']:.2f}"
         )
 
@@ -3261,7 +3334,8 @@ def artifact_outcome_from_state(state: dict[str, Any]) -> str:
         return "live"
     totals = state.get("totals") if isinstance(state.get("totals"), dict) else {}
     fail_n = int(totals.get("fail", state.get("fail", 0)) or 0)
-    return "fail" if fail_n else "pass"
+    blocked_n = int(totals.get("blocked", state.get("blocked", 0)) or 0)
+    return "fail" if fail_n else ("blocked" if blocked_n else "pass")
 
 
 def _library_entry(
@@ -3323,6 +3397,7 @@ def append_artifact_library_version(
     report_path: Path | None,
     tasks_pass: int,
     tasks_fail: int,
+    tasks_blocked: int = 0,
     deliverables: list[dict[str, Any]] | None = None,
     now: datetime | None = None,
 ) -> None:
@@ -3347,6 +3422,7 @@ def append_artifact_library_version(
         "outcome": outcome,
         "tasks_pass": tasks_pass,
         "tasks_fail": tasks_fail,
+        "tasks_blocked": tasks_blocked,
         "deliverables": [dict(item) for item in deliverables or []],
     }
     versions = [new_version]
@@ -3424,6 +3500,7 @@ def scan_run_states(state_dir: Path) -> list[dict[str, Any]]:
                 "state": data.get("state", "finished" if data.get("finished") else "live"),
                 "pass": data.get("pass", 0),
                 "fail": data.get("fail", 0),
+                "blocked": data.get("blocked", 0),
                 "elapsed_s": data.get("elapsed_s", 0),
                 "started_at": data.get("started_at", ""),
                 "artifact_path": data.get("artifact_path"),
@@ -3438,6 +3515,7 @@ def scan_run_states(state_dir: Path) -> list[dict[str, Any]]:
 
 STATUS_COLORS = {
     "pass": "var(--pass)",
+    "blocked": "#d28a12",
     "fail": "var(--fail)",
     "error": "var(--fail)",
     "timeout": "var(--fail)",
@@ -3592,6 +3670,7 @@ ARTIFACT_BASE_CSS = """
     flex: 0 0 9px;
   }
   .live-dot.pass { background: var(--pass); }
+  .live-dot.blocked { background: #d28a12; }
   .live-dot.fail, .live-dot.retry { background: var(--fail); }
   .live-dot.waiting { background: var(--waiting); }
   @media (prefers-reduced-motion: no-preference) {
@@ -3624,6 +3703,7 @@ ARTIFACT_BASE_CSS = """
   }
   .briefing .n-pass { color: var(--pass); }
   .briefing .n-fail { color: var(--fail); }
+  .briefing .n-blocked { color: #d28a12; }
   .rounds {
     display: flex;
     gap: 5px;
@@ -3637,6 +3717,7 @@ ARTIFACT_BASE_CSS = """
     opacity: .45;
   }
   .rounds .pass { background: var(--pass); opacity: 1; }
+  .rounds .blocked { background: #d28a12; opacity: 1; }
   .rounds .working { background: var(--accent); opacity: 1; }
   .rounds .retry, .rounds .fail { background: var(--fail); opacity: 1; }
   @media (prefers-reduced-motion: no-preference) {
@@ -3830,6 +3911,7 @@ ARTIFACT_BASE_CSS = """
     align-self: center;
   }
   .glyph.pass { background: var(--pass); }
+  .glyph.blocked { background: #d28a12; }
   .glyph.working { background: var(--accent); }
   .glyph.retry, .glyph.fail { background: var(--fail); }
   .glyph.waiting {
@@ -3853,6 +3935,7 @@ ARTIFACT_BASE_CSS = """
     white-space: nowrap;
   }
   .state.pass { color: var(--pass); }
+  .state.blocked { color: #d28a12; }
   .state.working { color: var(--accent); }
   .state.retry, .state.fail { color: var(--fail); }
   .state.waiting { color: var(--waiting); }
@@ -4282,6 +4365,7 @@ def task_status_counts(state: dict[str, Any]) -> dict[str, int]:
     buckets = [task_state_bucket(str(task.get("status", "queued"))) for task in tasks]
     pass_n = sum(1 for bucket in buckets if bucket == "pass")
     fail_n = sum(1 for bucket in buckets if bucket == "fail")
+    blocked_n = sum(1 for bucket in buckets if bucket == "blocked")
     running_n = sum(1 for bucket in buckets if bucket == "working")
     retry_n = sum(1 for bucket in buckets if bucket == "retry")
     waiting_n = sum(1 for bucket in buckets if bucket == "waiting")
@@ -4289,6 +4373,7 @@ def task_status_counts(state: dict[str, Any]) -> dict[str, int]:
         "total": len(tasks),
         "pass": pass_n,
         "fail": fail_n,
+        "blocked": blocked_n,
         "running": running_n,
         "retry": retry_n,
         "waiting": waiting_n,
@@ -4309,6 +4394,12 @@ def failed_phrase(count: int) -> str:
     if count == 1:
         return "1 failed"
     return f"{count} failed"
+
+
+def blocked_phrase(count: int) -> str:
+    if count == 1:
+        return "1 blocked for review"
+    return f"{count} blocked for review"
 
 
 def running_phrase(count: int) -> str:
@@ -4350,6 +4441,8 @@ def live_briefing_html(state: dict[str, Any]) -> str:
         parts.append(html_escape(waiting_phrase(counts["waiting"])))
     if counts["fail"]:
         parts.append(f'<span class="n-fail">{html_escape(failed_phrase(counts["fail"]))}</span>')
+    if counts["blocked"]:
+        parts.append(f'<span class="n-blocked">{html_escape(blocked_phrase(counts["blocked"]))}</span>')
     status_sentence = join_plain_html_parts(parts)
     return (
         f"Ringer is working on {total} {task_word(total)} — "
@@ -4366,14 +4459,17 @@ def final_briefing_html(state: dict[str, Any]) -> str:
     total = counts["total"]
     pass_n = counts["pass"]
     fail_n = counts["fail"]
+    blocked_n = counts["blocked"]
     elapsed = fmt_compact_duration(state.get("elapsed_s"))
     first = f"Ringer finished {total} {task_word(total)} in {elapsed}."
-    if fail_n == 0:
+    if fail_n == 0 and blocked_n == 0:
         return f"{html_escape(first)} <span class=\"n-pass\">All {total} finished and checked.</span>"
-    return (
-        f"{html_escape(first)} <span class=\"n-pass\">{pass_n} finished and checked</span>, "
-        f"<span class=\"n-fail\">{fail_n} failed after retry.</span>"
-    )
+    parts = [f'<span class="n-pass">{pass_n} finished and checked</span>']
+    if blocked_n:
+        parts.append(f'<span class="n-blocked">{blocked_n} blocked for review</span>')
+    if fail_n:
+        parts.append(f'<span class="n-fail">{fail_n} failed after retry</span>')
+    return f"{html_escape(first)} {join_plain_html_parts(parts)}."
 
 
 def join_plain_html_parts(parts: list[str]) -> str:
@@ -4426,6 +4522,9 @@ def plain_transition_event(
         if attempts > 1:
             return {"line": f"{task_key} passed on the second try, {fmt_compact_duration(task.get('elapsed_s'))}"}
         return {"line": f"{task_key} finished and checked, {fmt_compact_duration(task.get('elapsed_s'))}"}
+    if status == "blocked":
+        marker = str(task.get("verifier_defect_path") or VERIFIER_DEFECT_FILENAME)
+        return {"line": f"{task_key} blocked for review", "catch": marker}
     if status == "fail":
         if timed_out:
             return {"line": f"{task_key} timed out"}
@@ -4452,6 +4551,8 @@ def task_state_bucket(status: str) -> str:
     status = str(status).lower()
     if status == "pass":
         return "pass"
+    if status == "blocked":
+        return "blocked"
     if status in {"fail", "error", "timeout", "died"}:
         return "fail"
     if status == "retrying":
@@ -4465,6 +4566,8 @@ def task_state_word(status: str) -> str:
     bucket = task_state_bucket(status)
     if bucket == "pass":
         return "finished & checked"
+    if bucket == "blocked":
+        return "blocked — needs review"
     if bucket == "working":
         return "working"
     if bucket == "retry":
@@ -4498,12 +4601,15 @@ def render_progress_bar(tasks: list[dict[str, Any]], counts: dict[str, int]) -> 
         legend_parts.append(f'{counts["retry"]} sent back')
     if counts["fail"]:
         legend_parts.append(f'{counts["fail"]} failed')
+    if counts["blocked"]:
+        legend_parts.append(f'{counts["blocked"]} blocked for review')
     if counts["waiting"]:
         legend_parts.append(f'{counts["waiting"]} waiting')
     legend = " · ".join(legend_parts) if legend_parts else "No tasks"
     aria = (
         f'{counts["total"]} tasks: {counts["pass"]} passed, {counts["running"]} working, '
-        f'{counts["retry"]} retrying, {counts["waiting"]} waiting, {counts["fail"]} failed'
+        f'{counts["retry"]} retrying, {counts["waiting"]} waiting, {counts["fail"]} failed, '
+        f'{counts["blocked"]} blocked for review'
     )
     return f"""<div class="rounds" role="img" aria-label="{html_escape(aria)}">{bar}</div>
     <p class="legend">{html_escape(legend)}</p>"""
@@ -4528,7 +4634,7 @@ def render_work_section(
         tasks = [
             task
             for task in tasks
-            if task_state_bucket(str(task.get("status", "queued"))) in {"pass", "fail"}
+            if task_state_bucket(str(task.get("status", "queued"))) in {"pass", "fail", "blocked"}
         ]
     section_class = "work is-primary" if primary else "work"
     if not tasks:
@@ -4593,6 +4699,8 @@ def render_work_group(
         items_html = '<p class="empty-note">Finished and checked — this worker filed nothing to the shelf.</p>'
     elif bucket == "fail":
         items_html = '<p class="empty-note">Failed its check — nothing was delivered.</p>'
+    elif bucket == "blocked":
+        items_html = '<p class="empty-note">Blocked for review — read the verifier-defect marker before changing the check.</p>'
     elif bucket in {"working", "retry"}:
         items_html = '<p class="empty-note">Nothing delivered yet — still on it.</p>'
     else:
@@ -4603,14 +4711,16 @@ def render_work_group(
     # stands on its own — a failed task shows why it failed even when no
     # 'verified' sentence was written.
     verified_html = ""
-    if bucket in {"pass", "fail"}:
+    if bucket in {"pass", "fail", "blocked"}:
         verified_text = str(task.get("verified") or "").strip()
         proof_tail = str(task.get("check_output_tail") or "").strip()
         if verified_text:
             how_label = "How it was checked" if bucket == "pass" else "What the check demanded"
             verified_html += f'<span class="verified">{how_label}: {html_escape(verified_text)}</span>'
         if proof_tail:
-            proof_label = "See the proof" if bucket == "pass" else "See why it failed"
+            proof_label = "See the proof" if bucket == "pass" else (
+                "See the verifier concern" if bucket == "blocked" else "See why it failed"
+            )
             verified_html += (
                 f'<details class="proof"><summary>{proof_label}</summary>'
                 f"<pre>{html_escape(shorten(proof_tail, 1200))}</pre></details>"
@@ -4774,6 +4884,8 @@ def final_dot_bucket(state: dict[str, Any]) -> str:
     counts = task_status_counts(state)
     if counts["fail"]:
         return "fail"
+    if counts["blocked"]:
+        return "blocked"
     if counts["pass"]:
         return "pass"
     return "waiting"
@@ -4905,6 +5017,13 @@ def render_task_links(
             links.append(f'<a href="{html_escape(href)}">Read what it found</a>')
             break
 
+    marker_path = task.get("verifier_defect_path")
+    if marker_path:
+        marker_file = Path(str(marker_path))
+        if marker_file.exists():
+            href = portable(marker_file)
+            links.append(f'<a href="{html_escape(href)}">read verifier-defect marker</a>')
+
     log_path = task.get("log_path")
     worker_log = Path(str(log_path)) if log_path else None
     if worker_log is None and taskdir_path is not None:
@@ -4931,7 +5050,10 @@ def render_artifact_index_html(
     for entry in entries:
         state_label = str(entry.get("state", "live"))
         fail_n = entry.get("fail", 0) or 0
-        color = status_color(state_label if state_label in STATUS_COLORS else ("fail" if fail_n else "pass"))
+        blocked_n = entry.get("blocked", 0) or 0
+        fallback_state = "fail" if fail_n else ("blocked" if blocked_n else "pass")
+        color_state = fallback_state if state_label == "finished" else state_label
+        color = status_color(color_state if color_state in STATUS_COLORS else fallback_state)
         run_name = html_escape(str(entry.get("run_name", "ringer")))
         identity = html_escape(str(entry.get("identity", "unknown")))
         elapsed = fmt_duration(entry.get("elapsed_s"))
@@ -4960,7 +5082,7 @@ def render_artifact_index_html(
           <td><span class="chip" style="background:{color}">{html_escape(state_label)}</span></td>
           <td class="mono">{run_name}</td>
           <td class="mono">{identity}</td>
-          <td class="mono">{pass_n} pass / {fail_n} fail</td>
+          <td class="mono">{pass_n} pass / {fail_n} fail / {blocked_n} blocked</td>
           <td class="mono">{elapsed}</td>
           <td class="mono">{links_html}</td>
         </tr>"""
@@ -5095,7 +5217,7 @@ def inject_models_tab_into_ringside_html(html: str) -> str:
     }
     .breakdown-grid {
       display: grid;
-      grid-template-columns: minmax(120px, 1fr) repeat(5, minmax(70px, auto));
+      grid-template-columns: minmax(120px, 1fr) repeat(7, minmax(70px, auto));
       gap: 0;
       padding: 8px 10px 10px 46px;
       color: var(--muted);
@@ -5196,6 +5318,8 @@ def inject_models_tab_into_ringside_html(html: str) -> str:
         const cells = [
           '<div class="breakdown-head">Task type</div>',
           '<div class="breakdown-head">Tasks</div>',
+          '<div class="breakdown-head">Blocked</div>',
+          '<div class="breakdown-head">Block rate</div>',
           '<div class="breakdown-head">First</div>',
           '<div class="breakdown-head optional">Pass</div>',
           '<div class="breakdown-head optional">Attempts</div>',
@@ -5205,6 +5329,8 @@ def inject_models_tab_into_ringside_html(html: str) -> str:
           cells.push(
             `<div>${html(group.task_type || "(untyped)")}</div>`,
             `<div>${numberOrZeroLocal(group.tasks).toLocaleString()}</div>`,
+            `<div>${numberOrZeroLocal(group.blocked).toLocaleString()}</div>`,
+            `<div>${html(percent(group.block_rate))}</div>`,
             `<div>${html(percent(group.first_try_pass_rate))}</div>`,
             `<div class="optional">${html(percent(group.pass_rate))}</div>`,
             `<div class="optional">${numberOrZeroLocal(group.attempts).toLocaleString()}</div>`,
@@ -5242,6 +5368,8 @@ def inject_models_tab_into_ringside_html(html: str) -> str:
             `<td>${html(row.access || "unknown")}</td>`,
             `<td><span class="tier-badge ${html(tierClass)}">${html(tier)}</span></td>`,
             `<td class="numeric">${numberOrZeroLocal(row.tasks).toLocaleString()}</td>`,
+            `<td class="numeric">${numberOrZeroLocal(row.blocked).toLocaleString()}</td>`,
+            `<td class="numeric">${html(percent(row.block_rate))}</td>`,
             `<td class="numeric">${html(percent(row.first_try_pass_rate))}</td>`,
             `<td class="numeric">${html(percent(row.pass_rate))}</td>`,
             `<td class="numeric">${row.median_tokens === null || row.median_tokens === undefined ? "" : numberOrZeroLocal(row.median_tokens).toLocaleString()}</td>`,
@@ -5250,13 +5378,13 @@ def inject_models_tab_into_ringside_html(html: str) -> str:
             `<td class="model-notes" title="${html(notes)}">${html(row.latest_note || "")}</td>`,
             '</tr>',
           );
-          if (expanded) body.push(`<tr class="model-breakdown"><td colspan="12">${breakdown(bucketId)}</td></tr>`);
+          if (expanded) body.push(`<tr class="model-breakdown"><td colspan="14">${breakdown(bucketId)}</td></tr>`);
         });
         wrap.innerHTML = [
           '<table class="models-table">',
           '<thead><tr>',
           '<th>Model</th><th>Lab</th><th>Harness</th><th>API/Plan</th><th>Tier</th>',
-          '<th class="numeric">Tasks</th><th class="numeric">First try</th><th class="numeric">Pass</th>',
+          '<th class="numeric">Tasks</th><th class="numeric">Blocked</th><th class="numeric">Block rate</th><th class="numeric">First try</th><th class="numeric">Pass</th>',
           '<th class="numeric">Tokens (median)</th><th>Speed (median)</th><th>Last used</th><th>Notes</th>',
           '</tr></thead>',
           `<tbody>${body.join("")}</tbody>`,
@@ -5683,7 +5811,7 @@ class Dashboard:
                     try:
                         body = state_path.read_bytes()
                     except FileNotFoundError:
-                        body = b'{"run_name":"ringer","identity":"unknown","started_at":"","port":null,"dashboard_port":null,"tasks":[],"totals":{"running":0,"done":0,"pass":0,"fail":0,"tokens":0}}'
+                        body = b'{"run_name":"ringer","identity":"unknown","started_at":"","port":null,"dashboard_port":null,"tasks":[],"totals":{"running":0,"done":0,"pass":0,"fail":0,"blocked":0,"tokens":0}}'
                     send_response_body(
                         self,
                         HTTPStatus.OK,
@@ -6084,7 +6212,9 @@ def aggregate_model_log_rows(
                 "attempts": 0,
                 "passed": 0,
                 "failed": 0,
+                "blocked": 0,
                 "pass_rate": 0.0,
+                "block_rate": 0.0,
                 "first_try_pass_rate": 0.0,
                 "median_duration_ms": None,
                 "median_tokens": None,
@@ -6096,8 +6226,11 @@ def aggregate_model_log_rows(
         )
         group["tasks"] += 1
         group["attempts"] += len(ordered)
-        if model_log_text(final.get("verdict")).upper() == "PASS":
+        final_verdict = model_log_text(final.get("verdict")).upper()
+        if final_verdict == "PASS":
             group["passed"] += 1
+        elif final_verdict == "BLOCKED":
+            group["blocked"] += 1
         else:
             group["failed"] += 1
         if model_log_text(first.get("verdict")).upper() == "PASS":
@@ -6116,10 +6249,12 @@ def aggregate_model_log_rows(
     finalized: list[dict[str, Any]] = []
     for group in groups.values():
         tasks_count = group["tasks"]
-        group["pass_rate"] = group["passed"] / tasks_count if tasks_count else 0.0
+        scored_count = tasks_count - group["blocked"]
+        group["pass_rate"] = group["passed"] / scored_count if scored_count else 0.0
         group["first_try_pass_rate"] = (
-            group["_first_try_passed"] / tasks_count if tasks_count else 0.0
+            group["_first_try_passed"] / scored_count if scored_count else 0.0
         )
+        group["block_rate"] = group["blocked"] / tasks_count if tasks_count else 0.0
         group["median_duration_ms"] = median_int(group["_duration_ms"])
         group["median_tokens"] = median_int(group["_tokens"])
         finalized.append(
@@ -6134,7 +6269,9 @@ def aggregate_model_log_rows(
                 "attempts": group["attempts"],
                 "passed": group["passed"],
                 "failed": group["failed"],
+                "blocked": group["blocked"],
                 "pass_rate": group["pass_rate"],
+                "block_rate": group["block_rate"],
                 "first_try_pass_rate": group["first_try_pass_rate"],
                 "median_duration_ms": group["median_duration_ms"],
                 "median_tokens": group["median_tokens"],
@@ -6164,6 +6301,8 @@ MODEL_SCOREBOARD_COLUMNS = (
     "API/Plan",
     "Tier",
     "Tasks",
+    "Blocked",
+    "Block rate",
     "First try",
     "Pass",
     "Tokens (median)",
@@ -7883,6 +8022,7 @@ def aggregate_model_scoreboard_rows(
                 "attempts": 0,
                 "passed": 0,
                 "failed": 0,
+                "blocked": 0,
                 "retries": 0,
                 "first_try_passed": 0,
                 "last_seen": "",
@@ -7899,17 +8039,21 @@ def aggregate_model_scoreboard_rows(
                 "attempts": 0,
                 "passed": 0,
                 "failed": 0,
+                "blocked": 0,
                 "first_try_passed": 0,
                 "last_seen": "",
             },
         )
-        passed = model_log_text(final.get("verdict")).upper() == "PASS"
+        final_verdict = model_log_text(final.get("verdict")).upper()
+        passed = final_verdict == "PASS"
+        blocked = final_verdict == "BLOCKED"
         first_passed = model_log_text(first.get("verdict")).upper() == "PASS"
         for target in (model_entry, breakdown):
             target["tasks"] += 1
             target["attempts"] += len(ordered)
             target["passed"] += 1 if passed else 0
-            target["failed"] += 0 if passed else 1
+            target["blocked"] += 1 if blocked else 0
+            target["failed"] += 0 if passed or blocked else 1
             target["first_try_passed"] += 1 if first_passed else 0
             logged_at = model_log_text(final.get("logged_at"))
             if logged_at > target["last_seen"]:
@@ -7929,6 +8073,7 @@ def aggregate_model_scoreboard_rows(
         breakdown_rows = []
         for breakdown in entry["_task_types"].values():
             b_tasks = int(breakdown["tasks"])
+            b_scored = b_tasks - int(breakdown["blocked"])
             breakdown_rows.append(
                 {
                     "task_type": breakdown["task_type"],
@@ -7936,13 +8081,16 @@ def aggregate_model_scoreboard_rows(
                     "attempts": breakdown["attempts"],
                     "passed": breakdown["passed"],
                     "failed": breakdown["failed"],
-                    "first_try_pass_rate": breakdown["first_try_passed"] / b_tasks if b_tasks else 0.0,
-                    "pass_rate": breakdown["passed"] / b_tasks if b_tasks else 0.0,
+                    "blocked": breakdown["blocked"],
+                    "first_try_pass_rate": breakdown["first_try_passed"] / b_scored if b_scored else 0.0,
+                    "pass_rate": breakdown["passed"] / b_scored if b_scored else 0.0,
+                    "block_rate": breakdown["blocked"] / b_tasks if b_tasks else 0.0,
                     "last_seen": breakdown["last_seen"],
                 }
             )
         breakdown_rows.sort(key=lambda item: (-item["tasks"], item["task_type"]))
-        first_try_rate = entry["first_try_passed"] / tasks_count if tasks_count else 0.0
+        scored_count = tasks_count - int(entry["blocked"])
+        first_try_rate = entry["first_try_passed"] / scored_count if scored_count else 0.0
         tier = (
             "unranked"
             if entry["unattributed"]
@@ -7961,8 +8109,10 @@ def aggregate_model_scoreboard_rows(
                 "retries": entry["retries"],
                 "passed": entry["passed"],
                 "failed": entry["failed"],
-                "first_try_pass_rate": entry["first_try_passed"] / tasks_count if tasks_count else 0.0,
-                "pass_rate": entry["passed"] / tasks_count if tasks_count else 0.0,
+                "blocked": entry["blocked"],
+                "first_try_pass_rate": entry["first_try_passed"] / scored_count if scored_count else 0.0,
+                "pass_rate": entry["passed"] / scored_count if scored_count else 0.0,
+                "block_rate": entry["blocked"] / tasks_count if tasks_count else 0.0,
                 "median_duration_ms": median_int(entry["_duration_ms"]),
                 "median_tokens": median_int(entry["_tokens"]),
                 "last_seen": entry["last_seen"],
@@ -8219,12 +8369,14 @@ def render_task_breakdown_table(task_rows: list[dict[str, Any]]) -> str:
             f"""<tr>
       <td>{html_escape(str(item.get("task_type") or ""))}</td>
       <td class="num">{fmt_int(item.get("tasks"))}</td>
+      <td class="num">{fmt_int(item.get("blocked"))}</td>
+      <td class="num rate-cell">{rate_cell_html(item.get("block_rate"))}</td>
       <td class="num rate-cell">{rate_cell_html(item.get("first_try_pass_rate"))}</td>
       <td class="num rate-cell">{rate_cell_html(item.get("pass_rate"))}</td>
     </tr>"""
         )
     return f"""<table class="breakdown">
-    <thead><tr><th>task_type</th><th>n</th><th>first-try</th><th>pass</th></tr></thead>
+    <thead><tr><th>task_type</th><th>n</th><th>blocked</th><th>block rate</th><th>first-try</th><th>pass</th></tr></thead>
     <tbody>{"".join(rows)}</tbody>
   </table>"""
 
@@ -8590,6 +8742,8 @@ def render_model_table_pair(
       <td>{html_escape(access)}</td>
       <td><span class="tier-badge {html_escape(tier)}">{html_escape(tier_display)}</span></td>
       <td class="num">{fmt_int(row.get("tasks"))}</td>
+      <td class="num">{fmt_int(row.get("blocked"))}</td>
+      <td class="num rate-cell">{rate_cell_html(row.get("block_rate"))}</td>
       <td class="num rate-cell">{rate_cell_html(row.get("first_try_pass_rate"))}</td>
       <td class="num rate-cell">{rate_cell_html(row.get("pass_rate"))}</td>
       <td class="num">{html_escape(fmt_int(row.get("median_tokens"))) if row.get("median_tokens") is not None else ""}</td>
@@ -8598,7 +8752,7 @@ def render_model_table_pair(
       <td class="notes-cell" title="{html_escape(notes_title)}">{html_escape(latest_note)}</td>
     </tr>
     <tr class="detail-row">
-      <td colspan="12">
+      <td colspan="14">
         <details class="model-detail">
           <summary>details for {html_escape(model_display)}</summary>
           <div class="detail-content">
@@ -8647,7 +8801,7 @@ def render_model_scoreboard_html(
         )
     table_rows = "".join(rendered_rows)
     if not table_rows:
-        table_rows = '<tr><td colspan="12" class="muted">No local model evidence matched these filters.</td></tr>'
+        table_rows = '<tr><td colspan="14" class="muted">No local model evidence matched these filters.</td></tr>'
     unregistered_slugs = sorted(
         {str(row.get("model") or "") for row in ordered if row.get("unregistered") and row.get("model")}
     )
@@ -8705,6 +8859,8 @@ def render_model_scoreboard_html(
             <th>API/Plan</th>
             <th>Tier</th>
             <th class="num">Tasks</th>
+            <th class="num">Blocked</th>
+            <th class="num">Block rate</th>
             <th class="num">First try</th>
             <th class="num">Pass</th>
             <th class="num">Tokens (median)</th>
@@ -8789,7 +8945,7 @@ def print_model_log_table(
             f"{postgres_drain_archive.name}"
         )
     print(f"Model log: {path} ({rows_read} rows, {skipped} skipped lines){source_note}")
-    widths = (32, 20, 18, 18, 10, 7, 10, 7, 15, 14, 14, 60)
+    widths = (32, 20, 18, 18, 10, 7, 7, 10, 10, 7, 15, 14, 14, 60)
     header = " | ".join(
         f"{name:<{width}}" for name, width in zip(MODEL_SCOREBOARD_COLUMNS, widths)
     )
@@ -8820,6 +8976,8 @@ def print_model_log_table(
             str(group.get("access") or "unknown"),
             "not ranked" if group.get("tier") == "unranked" else str(group.get("tier") or ""),
             fmt_int(group.get("tasks")),
+            fmt_int(group.get("blocked")),
+            fmt_percent(group.get("block_rate")),
             fmt_percent(group.get("first_try_pass_rate")),
             fmt_percent(group.get("pass_rate")),
             "" if group.get("median_tokens") is None else fmt_int(group.get("median_tokens")),
@@ -9172,7 +9330,7 @@ class RingerRunner:
             with self.lock:
                 now = time.monotonic()
                 for runtime in self.runtimes:
-                    if runtime.status not in {"pass", "fail"}:
+                    if runtime.status not in {"pass", "fail", "blocked"}:
                         runtime.status = "fail"
                         runtime.final_verdict = "ERROR"
                         runtime.ended_at_monotonic = runtime.ended_at_monotonic or now
@@ -9214,13 +9372,25 @@ class RingerRunner:
             if not prepared:
                 await self._record_prepare_error(runtime, prepare_error or "taskdir preparation failed")
                 return
-            current_spec = runtime.task.spec
+            current_spec = self._worker_spec(runtime.task.spec, runtime.task)
             max_attempts = runtime.task.max_attempts
             for attempt in range(1, max_attempts + 1):
                 retrying = attempt > 1
                 with self.lock:
                     runtime.attempts = attempt
                     runtime.status = "retrying" if retrying else "running"
+                marker_path = runtime.taskdir / VERIFIER_DEFECT_FILENAME
+                marker_cleanup_ok = True
+                try:
+                    marker_path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    marker_cleanup_ok = False
+                    append_text(
+                        runtime.log_path,
+                        f"[ringer.py] could not remove stale {VERIFIER_DEFECT_FILENAME}: {exc}\n",
+                    )
                 attempt_started = time.monotonic()
                 worker = await self._run_worker(runtime, current_spec, attempt)
                 with self.lock:
@@ -9229,13 +9399,43 @@ class RingerRunner:
                     if worker.tokens is not None:
                         runtime.tokens = (runtime.tokens or 0) + worker.tokens
                 verify = await self.verifier.verify(runtime.task, runtime.taskdir)
-                verdict = verdict_for(worker, verify)
+                marker = read_verifier_defect_marker(runtime.taskdir)
+                if marker.exists and not marker_cleanup_ok:
+                    marker = VerifierDefectMarker(
+                        exists=True,
+                        valid=False,
+                        text=marker.text,
+                        note="ignored because the stale marker could not be removed before the attempt",
+                    )
+                verdict = verdict_for(
+                    worker,
+                    verify,
+                    allow_verifier_defect=runtime.task.allow_verifier_defect,
+                    verifier_defect_marker=marker,
+                )
+                if marker.exists:
+                    if verdict == "BLOCKED":
+                        self._preserve_verifier_defect(runtime, marker)
+                        append_text(
+                            runtime.log_path,
+                            f"[ringer.py] valid {VERIFIER_DEFECT_FILENAME}; task blocked for review\n",
+                        )
+                    else:
+                        reason = "the check passed" if verdict == "PASS" else (
+                            "the task did not opt in" if not runtime.task.allow_verifier_defect else marker.note
+                        )
+                        append_text(
+                            runtime.log_path,
+                            f"[ringer.py] ignored {VERIFIER_DEFECT_FILENAME}: {reason}\n",
+                        )
                 with self.lock:
                     runtime.last_check_returncode = verify.check_returncode
                     runtime.last_check_timed_out = verify.check_timed_out
                     runtime.last_check_output = verify.raw_output_excerpt
                 duration_ms = int((time.monotonic() - attempt_started) * 1000)
-                self._log_attempt(runtime, current_spec, retrying, worker, verify, verdict, duration_ms)
+                self._log_attempt(
+                    runtime, current_spec, retrying, worker, verify, verdict, duration_ms, marker
+                )
                 if verdict == "PASS":
                     self._harvest_deliverables_on_pass(runtime)
                     with self.lock:
@@ -9244,18 +9444,49 @@ class RingerRunner:
                         runtime.ended_at_monotonic = time.monotonic()
                     await self._cleanup_worktree_on_pass(runtime)
                     return
+                if verdict == "BLOCKED":
+                    with self.lock:
+                        runtime.status = "blocked"
+                        runtime.final_verdict = verdict
+                        runtime.ended_at_monotonic = time.monotonic()
+                    return
                 if attempt < max_attempts and verdict in {"FAIL", "TIMEOUT"}:
                     failure_context = build_failure_context(runtime.log_path, verify.raw_output_excerpt)
-                    current_spec = (
+                    retry_spec = (
                         f"{runtime.task.spec}\n\n"
                         f"Previous attempt failed: {failure_context}. Fix it."
                     )
+                    current_spec = self._worker_spec(retry_spec, runtime.task)
                     continue
                 with self.lock:
                     runtime.status = "fail"
                     runtime.final_verdict = verdict
                     runtime.ended_at_monotonic = time.monotonic()
                 return
+
+    @staticmethod
+    def _worker_spec(spec: str, task: TaskSpec) -> str:
+        if not task.allow_verifier_defect:
+            return spec
+        return f"{spec}\n\n{VERIFIER_DEFECT_FOOTER}"
+
+    def _preserve_verifier_defect(
+        self, runtime: TaskRuntime, marker: VerifierDefectMarker
+    ) -> None:
+        logs_dir = (self.manifest.workdir / "logs").resolve()
+        target = (logs_dir / f"{runtime.task.key}.{VERIFIER_DEFECT_FILENAME}").resolve()
+        if target != logs_dir and logs_dir not in target.parents:
+            append_text(runtime.log_path, "[ringer.py] refused unsafe verifier-defect log path\n")
+            return
+        try:
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(runtime.taskdir / VERIFIER_DEFECT_FILENAME, target)
+        except OSError as exc:
+            append_text(runtime.log_path, f"[ringer.py] verifier-defect copy failed: {exc}\n")
+            return
+        with self.lock:
+            runtime.verifier_defect_path = target
+            runtime.verifier_defect_excerpt = marker.text
 
     def _harvest_deliverables_on_pass(self, runtime: TaskRuntime) -> None:
         harvested: list[dict[str, Any]] = []
@@ -9610,6 +9841,7 @@ class RingerRunner:
         verify: VerifyResult,
         verdict: str,
         duration_ms: int,
+        verifier_defect_marker: VerifierDefectMarker | None = None,
     ) -> None:
         engine = self.config.engines.get(runtime.task.engine)
         resolved_model = resolved_task_model(
@@ -9641,6 +9873,13 @@ class RingerRunner:
             notes_parts.append(f"worker_error={worker.error}")
         if verify.missing_files:
             notes_parts.append(f"missing_expect_files={json.dumps(list(verify.missing_files))}")
+        if verifier_defect_marker is not None and verifier_defect_marker.exists:
+            disposition = "blocked" if verdict == "BLOCKED" else "ignored"
+            notes_parts.append(
+                f"verifier_defect_marker={disposition}: {verifier_defect_marker.note}"
+            )
+            notes_parts.append("verifier_defect_excerpt:")
+            notes_parts.append(verifier_defect_marker.text[:VERIFIER_DEFECT_MAX_BYTES])
         notes_parts.append("raw_check_output_first_2000_chars:")
         notes_parts.append(verify.raw_output_excerpt)
         with contextlib.suppress(Exception):
@@ -9795,13 +10034,21 @@ class AsyncFileCloser:
         self.fh.close()
 
 
-def verdict_for(worker: WorkerResult, verify: VerifyResult) -> str:
+def verdict_for(
+    worker: WorkerResult,
+    verify: VerifyResult,
+    *,
+    allow_verifier_defect: bool = False,
+    verifier_defect_marker: VerifierDefectMarker | None = None,
+) -> str:
     if worker.error:
         return "ERROR"
     if worker.timed_out or verify.check_timed_out:
         return "TIMEOUT"
     if verify.ok:
         return "PASS"
+    if allow_verifier_defect and verifier_defect_marker is not None and verifier_defect_marker.valid:
+        return "BLOCKED"
     return "FAIL"
 
 
@@ -10498,6 +10745,7 @@ def dry_run(
         print(f"    dir: {taskdir}")
         print(f"    timeout_s: {task.timeout_s}")
         print(f"    max_attempts: {task.max_attempts}")
+        print(f"    allow_verifier_defect: {str(task.allow_verifier_defect).lower()}")
         if task.full_access:
             print(f"    full_access: true allowed={full_access_allowed}")
         else:
@@ -10536,6 +10784,14 @@ def print_summary(run_id: str, runtimes: list[TaskRuntime]) -> None:
         print("\nsetup failures (no worker was spawned):")
         for runtime in setup_failures:
             print(f"  {runtime.task.key}: {runtime.setup_error}")
+    blocked = [r for r in runtimes if r.status == "blocked"]
+    if blocked:
+        print("\nblocked for review:")
+        for runtime in blocked:
+            marker = runtime.verifier_defect_path or (
+                runtime.taskdir / VERIFIER_DEFECT_FILENAME
+            )
+            print(f"  {runtime.task.key}: {marker}")
 
 
 def create_demo_manifest() -> Path:

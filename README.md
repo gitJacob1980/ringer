@@ -10,7 +10,7 @@ Frontier models are finally good enough to trust with real implementation — bu
 
 So split the roles. Your best model writes the specs and reviews the results. A swarm of cheap workers — Codex, Grok, anything with a CLI — does the implementation in parallel. Your premium budget stops scaling with lines of code written and starts scaling with decisions made.
 
-One problem: parallel agents lie. "Done" doesn't mean working. Ringer doesn't take the worker's word for anything — it **executes your check command** against the artifact. Pass or fail is decided by running the code, not by reading the agent's summary. Failures retry once with the failure context injected, and every attempt is logged so your setup gets measurably better over time.
+One problem: parallel agents lie. "Done" doesn't mean working. Ringer doesn't take the worker's word for anything — it **executes your check command** against the artifact. Verdicts are PASS, FAIL, ERROR, TIMEOUT, or BLOCKED (an opted-in claim that the verifier itself is defective). Failures retry once with the failure context injected, and every attempt is logged so your setup gets measurably better over time.
 
 And because a swarm you can't see is a swarm you don't trust: **Ringside**, a local web page every run opens automatically, showing every live swarm on your machine — who's running it, what each worker is doing, elapsed time, token burn — in real time, plus a versioned library of what past runs produced.
 
@@ -107,9 +107,12 @@ Each task gets its own directory, its own worker, its own log, and its own verdi
 | `engine_args` | Extra CLI flags for this task's worker, spliced in at the engine's `{engine_args}` placeholder — e.g. `["-c", "model_reasoning_effort=low"]` so the orchestrator picks reasoning depth per task |
 | `verified` | One plain-English sentence saying what the check proves — shown on the results page next to "finished & checked" |
 | `full_access` | Worker runs unsandboxed — required for workers that spawn their own sub-workers; must also be enabled in config |
+| `allow_verifier_defect` | Boolean at run or task level (task overrides run; default `false`). When enabled, lets a worker flag a broken check for review instead of bending the work around it |
 | `worktrees` (run-level) | Give each task an isolated git worktree of `repo` so parallel workers can't collide |
 
 > **Worktree footgun:** on PASS the task's worktree is removed — including anything written inside it. In worktrees mode, worker logs live outside task worktrees in `workdir/logs/`; have workers write deliverables outside the worktree too, or have your `check` copy artifacts out before it exits 0.
+
+When `allow_verifier_defect` is enabled and a worker concludes the check—not its work—is wrong, it may write `VERIFIER-DEFECT.md` in the task directory. The marker must contain three non-empty, case-insensitive line-start fields: `Check assertion:`, `Why it is wrong:`, and `Evidence:`. Ringer still executes the check. A passing check always produces PASS; a failed check plus a valid marker produces BLOCKED with no retry, preserves the marker in the run's `logs/` directory, and makes the run unsuccessful pending orchestrator review. Invalid, stale, or non-opted-in markers never block.
 
 Not sure what your tasks even are yet? [`docs/interview-prompt.md`](docs/interview-prompt.md) is a prompt you paste into any chatbot; it interviews you about the job and hands back a brief your orchestrating agent can turn into a manifest. Ready-made skeletons for the patterns that work live in [`templates/`](templates/).
 
@@ -312,7 +315,7 @@ Read it with:
 ./ringer.py models          # per-(model, task_type) scoreboard across the local log
 ```
 
-The scoreboard reports, per model and task_type: tasks, attempts, `pass_rate`, `first_try_pass_rate`, median duration and token count, and `last_seen`. The signal for routing is `first_try_pass_rate` — the share of tasks that passed on attempt 1 without a retry; `pass_rate` is the rescued rate after Ringer's single retry, so the gap between the two is the cost of the retry lane. Slice the log with `--log` (a different JSONL), `--task-type`, `--model`, `--engine`, `--since`, or `--json` for piping elsewhere.
+The scoreboard reports, per model and task_type: tasks, attempts, `blocked`, `block_rate`, `pass_rate`, `first_try_pass_rate`, median duration and token count, and `last_seen`. `block_rate` is blocked tasks divided by all tasks, so frequent verifier objections remain visible. BLOCKED tasks count in `tasks` but are excluded from the denominators of `pass_rate` and `first_try_pass_rate`; the latter is the share of scored tasks that passed on attempt 1 without a retry. `pass_rate` is the rescued rate after Ringer's single retry, so the gap between the two is the cost of the retry lane. Slice the log with `--log` (a different JSONL), `--task-type`, `--model`, `--engine`, `--since`, or `--json` for piping elsewhere.
 
 History from before the `model` / `task_type` / `retry` columns existed can be seeded in one pass:
 
