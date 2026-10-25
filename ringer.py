@@ -3094,7 +3094,7 @@ PROVEN_MIN_FIRST_TRY = 2 / 3
 
 def proven_model_group(group: dict[str, Any]) -> bool:
     return (
-        int(group.get("tasks") or 0) >= PROVEN_MIN_TASKS
+        int(group.get("scored_tasks", group.get("tasks")) or 0) >= PROVEN_MIN_TASKS
         and float(group.get("first_try_pass_rate") or 0) >= PROVEN_MIN_FIRST_TRY
     )
 
@@ -3163,7 +3163,9 @@ def print_model_explore(
         print(
             f"  {label:<9} {display} "
             f"task_type={group['task_type']} tasks={group['tasks']} "
-            f"blocked={group.get('blocked', 0)} block={group.get('block_rate', 0.0):.2f} "
+            f"blocked={group.get('blocked', 0)} "
+            f"check_timeouts={group.get('check_timeouts', 0)} "
+            f"block={group.get('block_rate', 0.0):.2f} "
             f"first={group['first_try_pass_rate']:.2f} pass={group['pass_rate']:.2f}"
         )
 
@@ -4529,6 +4531,11 @@ def plain_transition_event(
             return {"line": f"{task_key} passed on the second try, {fmt_compact_duration(task.get('elapsed_s'))}"}
         return {"line": f"{task_key} finished and checked, {fmt_compact_duration(task.get('elapsed_s'))}"}
     if status == "blocked":
+        if str(task.get("verdict") or "").upper() == "CHECK_TIMEOUT":
+            return {
+                "line": f"{task_key} check timed out — check problem",
+                "catch": check_excerpt,
+            }
         marker = str(task.get("verifier_defect_path") or VERIFIER_DEFECT_FILENAME)
         return {"line": f"{task_key} blocked for review", "catch": marker}
     if status == "fail":
@@ -4677,7 +4684,10 @@ def render_work_group(
     status = str(task.get("status", "queued"))
     bucket = task_state_bucket(status)
     css_bucket = "working" if bucket == "working" else bucket
-    state_word = html_escape(task_state_word(status))
+    check_timeout = str(task.get("verdict") or "").upper() == "CHECK_TIMEOUT"
+    state_word = html_escape(
+        "check timed out — check problem" if check_timeout else task_state_word(status)
+    )
     elapsed = html_escape(fmt_compact_duration(task.get("elapsed_s")))
 
     activity = task_activity_line(task, bucket)
@@ -4706,7 +4716,11 @@ def render_work_group(
     elif bucket == "fail":
         items_html = '<p class="empty-note">Failed its check — nothing was delivered.</p>'
     elif bucket == "blocked":
-        items_html = '<p class="empty-note">Blocked for review — read the verifier-defect marker before changing the check.</p>'
+        items_html = (
+            '<p class="empty-note">The check timed out — no worker failure was recorded.</p>'
+            if check_timeout
+            else '<p class="empty-note">Blocked for review — read the verifier-defect marker before changing the check.</p>'
+        )
     elif bucket in {"working", "retry"}:
         items_html = '<p class="empty-note">Nothing delivered yet — still on it.</p>'
     else:
@@ -4725,7 +4739,9 @@ def render_work_group(
             verified_html += f'<span class="verified">{how_label}: {html_escape(verified_text)}</span>'
         if proof_tail:
             proof_label = "See the proof" if bucket == "pass" else (
-                "See the verifier concern" if bucket == "blocked" else "See why it failed"
+                "See the check timeout" if check_timeout else (
+                    "See the verifier concern" if bucket == "blocked" else "See why it failed"
+                )
             )
             verified_html += (
                 f'<details class="proof"><summary>{proof_label}</summary>'
@@ -5223,7 +5239,7 @@ def inject_models_tab_into_ringside_html(html: str) -> str:
     }
     .breakdown-grid {
       display: grid;
-      grid-template-columns: minmax(120px, 1fr) repeat(7, minmax(70px, auto));
+      grid-template-columns: minmax(120px, 1fr) repeat(8, minmax(70px, auto));
       gap: 0;
       padding: 8px 10px 10px 46px;
       color: var(--muted);
@@ -5325,6 +5341,7 @@ def inject_models_tab_into_ringside_html(html: str) -> str:
           '<div class="breakdown-head">Task type</div>',
           '<div class="breakdown-head">Tasks</div>',
           '<div class="breakdown-head">Blocked</div>',
+          '<div class="breakdown-head">Check TO</div>',
           '<div class="breakdown-head">Block rate</div>',
           '<div class="breakdown-head">First</div>',
           '<div class="breakdown-head optional">Pass</div>',
@@ -5336,6 +5353,7 @@ def inject_models_tab_into_ringside_html(html: str) -> str:
             `<div>${html(group.task_type || "(untyped)")}</div>`,
             `<div>${numberOrZeroLocal(group.tasks).toLocaleString()}</div>`,
             `<div>${numberOrZeroLocal(group.blocked).toLocaleString()}</div>`,
+            `<div>${numberOrZeroLocal(group.check_timeouts).toLocaleString()}</div>`,
             `<div>${html(percent(group.block_rate))}</div>`,
             `<div>${html(percent(group.first_try_pass_rate))}</div>`,
             `<div class="optional">${html(percent(group.pass_rate))}</div>`,
@@ -5375,6 +5393,7 @@ def inject_models_tab_into_ringside_html(html: str) -> str:
             `<td><span class="tier-badge ${html(tierClass)}">${html(tier)}</span></td>`,
             `<td class="numeric">${numberOrZeroLocal(row.tasks).toLocaleString()}</td>`,
             `<td class="numeric">${numberOrZeroLocal(row.blocked).toLocaleString()}</td>`,
+            `<td class="numeric">${numberOrZeroLocal(row.check_timeouts).toLocaleString()}</td>`,
             `<td class="numeric">${html(percent(row.block_rate))}</td>`,
             `<td class="numeric">${html(percent(row.first_try_pass_rate))}</td>`,
             `<td class="numeric">${html(percent(row.pass_rate))}</td>`,
@@ -5384,13 +5403,13 @@ def inject_models_tab_into_ringside_html(html: str) -> str:
             `<td class="model-notes" title="${html(notes)}">${html(row.latest_note || "")}</td>`,
             '</tr>',
           );
-          if (expanded) body.push(`<tr class="model-breakdown"><td colspan="14">${breakdown(bucketId)}</td></tr>`);
+          if (expanded) body.push(`<tr class="model-breakdown"><td colspan="15">${breakdown(bucketId)}</td></tr>`);
         });
         wrap.innerHTML = [
           '<table class="models-table">',
           '<thead><tr>',
           '<th>Model</th><th>Lab</th><th>Harness</th><th>API/Plan</th><th>Tier</th>',
-          '<th class="numeric">Tasks</th><th class="numeric">Blocked</th><th class="numeric">Block rate</th><th class="numeric">First try</th><th class="numeric">Pass</th>',
+          '<th class="numeric">Tasks</th><th class="numeric">Blocked</th><th class="numeric">Check TO</th><th class="numeric">Block rate</th><th class="numeric">First try</th><th class="numeric">Pass</th>',
           '<th class="numeric">Tokens (median)</th><th>Speed (median)</th><th>Last used</th><th>Notes</th>',
           '</tr></thead>',
           `<tbody>${body.join("")}</tbody>`,
@@ -6219,6 +6238,7 @@ def aggregate_model_log_rows(
                 "passed": 0,
                 "failed": 0,
                 "blocked": 0,
+                "check_timeouts": 0,
                 "pass_rate": 0.0,
                 "block_rate": 0.0,
                 "first_try_pass_rate": 0.0,
@@ -6237,6 +6257,8 @@ def aggregate_model_log_rows(
             group["passed"] += 1
         elif final_verdict == "BLOCKED":
             group["blocked"] += 1
+        elif final_verdict == "CHECK_TIMEOUT":
+            group["check_timeouts"] += 1
         else:
             group["failed"] += 1
         if model_log_text(first.get("verdict")).upper() == "PASS":
@@ -6255,7 +6277,7 @@ def aggregate_model_log_rows(
     finalized: list[dict[str, Any]] = []
     for group in groups.values():
         tasks_count = group["tasks"]
-        scored_count = tasks_count - group["blocked"]
+        scored_count = tasks_count - group["blocked"] - group["check_timeouts"]
         group["pass_rate"] = group["passed"] / scored_count if scored_count else 0.0
         group["first_try_pass_rate"] = (
             group["_first_try_passed"] / scored_count if scored_count else 0.0
@@ -6276,6 +6298,8 @@ def aggregate_model_log_rows(
                 "passed": group["passed"],
                 "failed": group["failed"],
                 "blocked": group["blocked"],
+                "check_timeouts": group["check_timeouts"],
+                "scored_tasks": scored_count,
                 "pass_rate": group["pass_rate"],
                 "block_rate": group["block_rate"],
                 "first_try_pass_rate": group["first_try_pass_rate"],
@@ -6308,6 +6332,7 @@ MODEL_SCOREBOARD_COLUMNS = (
     "Tier",
     "Tasks",
     "Blocked",
+    "Check TO",
     "Block rate",
     "First try",
     "Pass",
@@ -6679,7 +6704,8 @@ def enrich_model_groups_with_identity(
             item["tier"] = "unranked"
         elif "tier" not in item:
             item["tier"] = model_scoreboard_tier(
-                int(item.get("tasks") or 0), float(item.get("first_try_pass_rate") or 0)
+                int(item.get("scored_tasks", item.get("tasks")) or 0),
+                float(item.get("first_try_pass_rate") or 0),
             )
         item["bucket_id"] = "|".join(
             (
@@ -8029,6 +8055,7 @@ def aggregate_model_scoreboard_rows(
                 "passed": 0,
                 "failed": 0,
                 "blocked": 0,
+                "check_timeouts": 0,
                 "retries": 0,
                 "first_try_passed": 0,
                 "last_seen": "",
@@ -8046,6 +8073,7 @@ def aggregate_model_scoreboard_rows(
                 "passed": 0,
                 "failed": 0,
                 "blocked": 0,
+                "check_timeouts": 0,
                 "first_try_passed": 0,
                 "last_seen": "",
             },
@@ -8053,13 +8081,15 @@ def aggregate_model_scoreboard_rows(
         final_verdict = model_log_text(final.get("verdict")).upper()
         passed = final_verdict == "PASS"
         blocked = final_verdict == "BLOCKED"
+        check_timeout = final_verdict == "CHECK_TIMEOUT"
         first_passed = model_log_text(first.get("verdict")).upper() == "PASS"
         for target in (model_entry, breakdown):
             target["tasks"] += 1
             target["attempts"] += len(ordered)
             target["passed"] += 1 if passed else 0
             target["blocked"] += 1 if blocked else 0
-            target["failed"] += 0 if passed or blocked else 1
+            target["check_timeouts"] += 1 if check_timeout else 0
+            target["failed"] += 0 if passed or blocked or check_timeout else 1
             target["first_try_passed"] += 1 if first_passed else 0
             logged_at = model_log_text(final.get("logged_at"))
             if logged_at > target["last_seen"]:
@@ -8079,7 +8109,11 @@ def aggregate_model_scoreboard_rows(
         breakdown_rows = []
         for breakdown in entry["_task_types"].values():
             b_tasks = int(breakdown["tasks"])
-            b_scored = b_tasks - int(breakdown["blocked"])
+            b_scored = (
+                b_tasks
+                - int(breakdown["blocked"])
+                - int(breakdown["check_timeouts"])
+            )
             breakdown_rows.append(
                 {
                     "task_type": breakdown["task_type"],
@@ -8088,6 +8122,8 @@ def aggregate_model_scoreboard_rows(
                     "passed": breakdown["passed"],
                     "failed": breakdown["failed"],
                     "blocked": breakdown["blocked"],
+                    "check_timeouts": breakdown["check_timeouts"],
+                    "scored_tasks": b_scored,
                     "first_try_pass_rate": breakdown["first_try_passed"] / b_scored if b_scored else 0.0,
                     "pass_rate": breakdown["passed"] / b_scored if b_scored else 0.0,
                     "block_rate": breakdown["blocked"] / b_tasks if b_tasks else 0.0,
@@ -8095,12 +8131,14 @@ def aggregate_model_scoreboard_rows(
                 }
             )
         breakdown_rows.sort(key=lambda item: (-item["tasks"], item["task_type"]))
-        scored_count = tasks_count - int(entry["blocked"])
+        scored_count = (
+            tasks_count - int(entry["blocked"]) - int(entry["check_timeouts"])
+        )
         first_try_rate = entry["first_try_passed"] / scored_count if scored_count else 0.0
         tier = (
             "unranked"
             if entry["unattributed"]
-            else model_scoreboard_tier(tasks_count, first_try_rate)
+            else model_scoreboard_tier(scored_count, first_try_rate)
         )
         finalized.append(
             {
@@ -8116,6 +8154,8 @@ def aggregate_model_scoreboard_rows(
                 "passed": entry["passed"],
                 "failed": entry["failed"],
                 "blocked": entry["blocked"],
+                "check_timeouts": entry["check_timeouts"],
+                "scored_tasks": scored_count,
                 "first_try_pass_rate": entry["first_try_passed"] / scored_count if scored_count else 0.0,
                 "pass_rate": entry["passed"] / scored_count if scored_count else 0.0,
                 "block_rate": entry["blocked"] / tasks_count if tasks_count else 0.0,
@@ -8376,13 +8416,14 @@ def render_task_breakdown_table(task_rows: list[dict[str, Any]]) -> str:
       <td>{html_escape(str(item.get("task_type") or ""))}</td>
       <td class="num">{fmt_int(item.get("tasks"))}</td>
       <td class="num">{fmt_int(item.get("blocked"))}</td>
+      <td class="num">{fmt_int(item.get("check_timeouts"))}</td>
       <td class="num rate-cell">{rate_cell_html(item.get("block_rate"))}</td>
       <td class="num rate-cell">{rate_cell_html(item.get("first_try_pass_rate"))}</td>
       <td class="num rate-cell">{rate_cell_html(item.get("pass_rate"))}</td>
     </tr>"""
         )
     return f"""<table class="breakdown">
-    <thead><tr><th>task_type</th><th>n</th><th>blocked</th><th>block rate</th><th>first-try</th><th>pass</th></tr></thead>
+    <thead><tr><th>task_type</th><th>n</th><th>blocked</th><th>check TO</th><th>block rate</th><th>first-try</th><th>pass</th></tr></thead>
     <tbody>{"".join(rows)}</tbody>
   </table>"""
 
@@ -8749,6 +8790,7 @@ def render_model_table_pair(
       <td><span class="tier-badge {html_escape(tier)}">{html_escape(tier_display)}</span></td>
       <td class="num">{fmt_int(row.get("tasks"))}</td>
       <td class="num">{fmt_int(row.get("blocked"))}</td>
+      <td class="num">{fmt_int(row.get("check_timeouts"))}</td>
       <td class="num rate-cell">{rate_cell_html(row.get("block_rate"))}</td>
       <td class="num rate-cell">{rate_cell_html(row.get("first_try_pass_rate"))}</td>
       <td class="num rate-cell">{rate_cell_html(row.get("pass_rate"))}</td>
@@ -8758,7 +8800,7 @@ def render_model_table_pair(
       <td class="notes-cell" title="{html_escape(notes_title)}">{html_escape(latest_note)}</td>
     </tr>
     <tr class="detail-row">
-      <td colspan="14">
+      <td colspan="15">
         <details class="model-detail">
           <summary>details for {html_escape(model_display)}</summary>
           <div class="detail-content">
@@ -8807,7 +8849,7 @@ def render_model_scoreboard_html(
         )
     table_rows = "".join(rendered_rows)
     if not table_rows:
-        table_rows = '<tr><td colspan="14" class="muted">No local model evidence matched these filters.</td></tr>'
+        table_rows = '<tr><td colspan="15" class="muted">No local model evidence matched these filters.</td></tr>'
     unregistered_slugs = sorted(
         {str(row.get("model") or "") for row in ordered if row.get("unregistered") and row.get("model")}
     )
@@ -8866,6 +8908,7 @@ def render_model_scoreboard_html(
             <th>Tier</th>
             <th class="num">Tasks</th>
             <th class="num">Blocked</th>
+            <th class="num">Check TO</th>
             <th class="num">Block rate</th>
             <th class="num">First try</th>
             <th class="num">Pass</th>
@@ -8951,7 +8994,7 @@ def print_model_log_table(
             f"{postgres_drain_archive.name}"
         )
     print(f"Model log: {path} ({rows_read} rows, {skipped} skipped lines){source_note}")
-    widths = (32, 20, 18, 18, 10, 7, 7, 10, 10, 7, 15, 14, 14, 60)
+    widths = (32, 20, 18, 18, 10, 7, 7, 8, 10, 10, 7, 15, 14, 14, 60)
     header = " | ".join(
         f"{name:<{width}}" for name, width in zip(MODEL_SCOREBOARD_COLUMNS, widths)
     )
@@ -8983,6 +9026,7 @@ def print_model_log_table(
             "not ranked" if group.get("tier") == "unranked" else str(group.get("tier") or ""),
             fmt_int(group.get("tasks")),
             fmt_int(group.get("blocked")),
+            fmt_int(group.get("check_timeouts")),
             fmt_percent(group.get("block_rate")),
             fmt_percent(group.get("first_try_pass_rate")),
             fmt_percent(group.get("pass_rate")),
@@ -9451,7 +9495,7 @@ class RingerRunner:
                         runtime.ended_at_monotonic = time.monotonic()
                     await self._cleanup_worktree_on_pass(runtime)
                     return
-                if verdict == "BLOCKED":
+                if verdict in {"BLOCKED", "CHECK_TIMEOUT"}:
                     with self.lock:
                         runtime.status = "blocked"
                         runtime.final_verdict = verdict
@@ -9880,6 +9924,10 @@ class RingerRunner:
             notes_parts.append(f"worker_error={worker.error}")
         if verify.missing_files:
             notes_parts.append(f"missing_expect_files={json.dumps(list(verify.missing_files))}")
+        if verify.check_timed_out:
+            notes_parts.append(
+                f"check_timed_out=true check_timeout_s={runtime.task.check_timeout_s}"
+            )
         if verifier_defect_marker is not None and verifier_defect_marker.exists:
             disposition = "blocked" if verdict == "BLOCKED" else "ignored"
             notes_parts.append(
@@ -10050,8 +10098,10 @@ def verdict_for(
 ) -> str:
     if worker.error:
         return "ERROR"
-    if worker.timed_out or verify.check_timed_out:
+    if worker.timed_out:
         return "TIMEOUT"
+    if verify.check_timed_out:
+        return "CHECK_TIMEOUT"
     if verify.ok:
         return "PASS"
     if allow_verifier_defect and verifier_defect_marker is not None and verifier_defect_marker.valid:
@@ -10791,7 +10841,18 @@ def print_summary(run_id: str, runtimes: list[TaskRuntime]) -> None:
         print("\nsetup failures (no worker was spawned):")
         for runtime in setup_failures:
             print(f"  {runtime.task.key}: {runtime.setup_error}")
-    blocked = [r for r in runtimes if r.status == "blocked"]
+    check_timeouts = [r for r in runtimes if r.final_verdict == "CHECK_TIMEOUT"]
+    if check_timeouts:
+        print("\ncheck problems:")
+        for runtime in check_timeouts:
+            print(
+                f"  {runtime.task.key}: check timed out after "
+                f"{runtime.task.check_timeout_s}s"
+            )
+    blocked = [
+        r for r in runtimes
+        if r.status == "blocked" and r.final_verdict != "CHECK_TIMEOUT"
+    ]
     if blocked:
         print("\nblocked for review:")
         for runtime in blocked:
@@ -10799,6 +10860,234 @@ def print_summary(run_id: str, runtimes: list[TaskRuntime]) -> None:
                 runtime.taskdir / VERIFIER_DEFECT_FILENAME
             )
             print(f"  {runtime.task.key}: {marker}")
+
+
+CHECK_TIMEOUT_NOTE_MARKER = "[ringer.py] check timed out after"
+
+
+def check_timeout_candidate(row: Mapping[str, Any]) -> bool:
+    notes = row.get("notes")
+    return (
+        row.get("verdict") == "TIMEOUT"
+        and isinstance(notes, str)
+        and CHECK_TIMEOUT_NOTE_MARKER in notes
+    )
+
+
+def reclassify_candidate_identity(row: Mapping[str, Any]) -> tuple[str, str, str, int]:
+    retry = row.get("retry")
+    if isinstance(retry, str):
+        retry = retry.strip().lower() == "true"
+    return (
+        str(row.get("run_id") or ""),
+        str(row.get("task_key") or ""),
+        str(row.get("logged_at") or ""),
+        1 if retry is True or retry == 1 else 0,
+    )
+
+
+def reclassify_display_candidate(store: str, row: Mapping[str, Any]) -> None:
+    retry = "true" if reclassify_candidate_identity(row)[3] else "false"
+    print(
+        f"{store} run_id={row.get('run_id', '')} task_key={row.get('task_key', '')} "
+        f"retry={retry} logged_at={row.get('logged_at', '')} model={row.get('model', '')}"
+    )
+
+
+def reclassify_jsonl_check_timeouts(
+    path: Path, *, apply: bool
+) -> tuple[list[dict[str, Any]], int]:
+    try:
+        original_lines = path.read_bytes().splitlines(keepends=True)
+    except FileNotFoundError:
+        return [], 0
+    candidates: list[dict[str, Any]] = []
+    rewritten = list(original_lines)
+    for index, raw_line in enumerate(original_lines):
+        try:
+            row = json.loads(raw_line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if not isinstance(row, dict) or not check_timeout_candidate(row):
+            continue
+        candidates.append(row)
+        if apply:
+            row["verdict"] = "CHECK_TIMEOUT"
+            newline = b"\r\n" if raw_line.endswith(b"\r\n") else (
+                b"\n" if raw_line.endswith(b"\n") else b""
+            )
+            rewritten[index] = json.dumps(row).encode("utf-8") + newline
+    if apply and candidates:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.writelines(rewritten)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(temp_name, path)
+        except BaseException:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temp_name)
+            raise
+    return candidates, len(candidates) if apply else 0
+
+
+def reclassify_postgres_check_timeouts(
+    conn: Any, *, apply: bool
+) -> tuple[list[dict[str, Any]], int]:
+    cursor = conn.execute(
+        """
+        SELECT id, run_id, task_key, retry, logged_at, model, notes
+        FROM swarm_runs
+        WHERE verdict = %s AND notes LIKE %s
+        ORDER BY id
+        """,
+        ("TIMEOUT", f"%{CHECK_TIMEOUT_NOTE_MARKER}%"),
+    )
+    records = cursor.fetchall() if hasattr(cursor, "fetchall") else list(cursor)
+    candidates: list[dict[str, Any]] = []
+    for record in records:
+        if isinstance(record, Mapping):
+            row = dict(record)
+        else:
+            row = dict(
+                zip(
+                    ("id", "run_id", "task_key", "retry", "logged_at", "model", "notes"),
+                    record,
+                )
+            )
+        logged_at = row.get("logged_at")
+        isoformat = getattr(logged_at, "isoformat", None)
+        if callable(isoformat):
+            row["logged_at"] = isoformat()
+        candidates.append(row)
+    changed = 0
+    if apply:
+        for row in candidates:
+            result = conn.execute(
+                """
+                UPDATE swarm_runs
+                SET verdict = %s,
+                    payload = jsonb_set(
+                        COALESCE(payload, '{}'::jsonb),
+                        '{verdict}',
+                        to_jsonb(%s::text),
+                        true
+                    )
+                WHERE id = %s AND verdict = %s AND notes LIKE %s
+                """,
+                (
+                    "CHECK_TIMEOUT",
+                    "CHECK_TIMEOUT",
+                    row["id"],
+                    "TIMEOUT",
+                    f"%{CHECK_TIMEOUT_NOTE_MARKER}%",
+                ),
+            )
+            rowcount = getattr(result, "rowcount", 1)
+            changed += max(0, int(rowcount if rowcount is not None else 1))
+        commit = getattr(conn, "commit", None)
+        if callable(commit):
+            commit()
+    return candidates, changed
+
+
+def reclassify_sqlite_check_timeouts(
+    path: Path,
+    source_candidates: Iterable[Mapping[str, Any]],
+    *,
+    apply: bool,
+) -> tuple[list[dict[str, Any]], int]:
+    sqlite_module = ensure_sqlite_available()
+    if not path.exists():
+        return [], 0
+    identities = {reclassify_candidate_identity(row) for row in source_candidates}
+    if not identities:
+        return [], 0
+    conn = sqlite_module.connect(path)
+    conn.row_factory = sqlite_module.Row
+    candidates: list[dict[str, Any]] = []
+    changed = 0
+    try:
+        for run_id, task_key, logged_at, retry in sorted(identities):
+            rows = conn.execute(
+                """
+                SELECT run_id, task_key, logged_at, retry, model, verdict
+                FROM attempts
+                WHERE run_id IS ? AND task_key IS ? AND logged_at IS ?
+                  AND retry IS ? AND verdict = ?
+                """,
+                (run_id, task_key, logged_at, retry, "TIMEOUT"),
+            ).fetchall()
+            candidates.extend(dict(row) for row in rows)
+            if apply and rows:
+                result = conn.execute(
+                    """
+                    UPDATE attempts SET verdict = ?
+                    WHERE run_id IS ? AND task_key IS ? AND logged_at IS ?
+                      AND retry IS ? AND verdict = ?
+                    """,
+                    ("CHECK_TIMEOUT", run_id, task_key, logged_at, retry, "TIMEOUT"),
+                )
+                changed += max(0, int(result.rowcount))
+        if apply:
+            conn.commit()
+    finally:
+        conn.close()
+    return candidates, changed
+
+
+def run_reclassify_check_timeouts_command(
+    config: AppConfig,
+    args: argparse.Namespace,
+    *,
+    postgres_connection_factory: Callable[[PostgresEvalConfig], Any] | None = None,
+) -> int:
+    apply = bool(args.apply)
+    source_candidates: list[dict[str, Any]] = []
+    results: list[tuple[str, list[dict[str, Any]], int]] = []
+
+    log_path = (args.log or config.eval.jsonl_path).expanduser().resolve()
+    json_candidates, json_changed = reclassify_jsonl_check_timeouts(
+        log_path, apply=apply
+    )
+    source_candidates.extend(json_candidates)
+    results.append(("jsonl", json_candidates, json_changed))
+
+    if not args.no_postgres:
+        if config.eval.postgres is None:
+            results.append(("postgres (not configured)", [], 0))
+        else:
+            factory = postgres_connection_factory or connect_eval_postgres
+            pg_conn = factory(config.eval.postgres)
+            try:
+                pg_candidates, pg_changed = reclassify_postgres_check_timeouts(
+                    pg_conn, apply=apply
+                )
+            finally:
+                close = getattr(pg_conn, "close", None)
+                if callable(close):
+                    close()
+            source_candidates.extend(pg_candidates)
+            results.append(("postgres", pg_candidates, pg_changed))
+
+    if not args.no_db:
+        db_path = (args.db or default_read_model_db_path()).expanduser().resolve()
+        db_candidates, db_changed = reclassify_sqlite_check_timeouts(
+            db_path, source_candidates, apply=apply
+        )
+        results.append(("sqlite", db_candidates, db_changed))
+
+    for store, candidates, _changed in results:
+        for row in candidates:
+            reclassify_display_candidate(store, row)
+    for store, candidates, changed in results:
+        after = len(candidates) - changed
+        print(f"{store}: before={len(candidates)} after={after} changed={changed}")
+    if not apply:
+        print("Dry run - nothing written. Re-run with --apply.")
+    return 0
 
 
 def create_demo_manifest() -> Path:
@@ -11667,6 +11956,27 @@ def build_parser() -> argparse.ArgumentParser:
     models_parser.add_argument("--open", action="store_true", help="render the HTML scoreboard to the artifact library and open it")
     models_parser.add_argument("--json", action="store_true", help="print the scoreboard as JSON")
 
+    reclassify_parser = subparsers.add_parser(
+        "reclassify-check-timeouts",
+        help="repair historical check timeouts that were recorded as worker timeouts",
+    )
+    reclassify_parser.add_argument(
+        "--config", type=Path, default=argparse.SUPPRESS, help=argparse.SUPPRESS
+    )
+    reclassify_parser.add_argument("--log", type=Path, help="path to local eval JSONL log")
+    reclassify_parser.add_argument(
+        "--db", type=Path, help="path to SQLite read model (default: ~/.ringer/ringer.db)"
+    )
+    reclassify_parser.add_argument(
+        "--no-postgres", action="store_true", help="skip the configured Postgres store"
+    )
+    reclassify_parser.add_argument(
+        "--no-db", action="store_true", help="skip the local SQLite read model"
+    )
+    reclassify_parser.add_argument(
+        "--apply", action="store_true", help="write the proposed verdict changes"
+    )
+
     catalog_parser = subparsers.add_parser("catalog", help="show or refresh the local OpenRouter model catalog")
     catalog_parser.add_argument("--refresh", action="store_true", help="fetch source and rewrite the local snapshot")
     catalog_parser.add_argument("--source", help=f"OpenRouter models URL or fixture file (default: {DEFAULT_CATALOG_SOURCE})")
@@ -11762,6 +12072,8 @@ def main(argv: list[str] | None = None) -> int:
             return run_db_command(config, args)
         if args.command == "models":
             return run_models_command(config, args)
+        if args.command == "reclassify-check-timeouts":
+            return run_reclassify_check_timeouts_command(config, args)
         if args.command == "hud":
             return run_persistent_hud(
                 config,

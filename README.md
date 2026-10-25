@@ -10,7 +10,7 @@ Frontier models are finally good enough to trust with real implementation — bu
 
 So split the roles. Your best model writes the specs and reviews the results. A swarm of cheap workers — Codex, Grok, anything with a CLI — does the implementation in parallel. Your premium budget stops scaling with lines of code written and starts scaling with decisions made.
 
-One problem: parallel agents lie. "Done" doesn't mean working. Ringer doesn't take the worker's word for anything — it **executes your check command** against the artifact. Verdicts are PASS, FAIL, ERROR, TIMEOUT, or BLOCKED (an opted-in claim that the verifier itself is defective). Failures retry once with the failure context injected, and every attempt is logged so your setup gets measurably better over time.
+One problem: parallel agents lie. "Done" doesn't mean working. Ringer doesn't take the worker's word for anything — it **executes your check command** against the artifact. Verdicts are PASS, FAIL, ERROR, TIMEOUT, CHECK_TIMEOUT, or BLOCKED (an opted-in claim that the verifier itself is defective). TIMEOUT means the worker exceeded its limit; CHECK_TIMEOUT means the check exceeded `check_timeout_s`, is not retried, and is not charged to the worker. Failures retry once with the failure context injected, and every attempt is logged so your setup gets measurably better over time.
 
 And because a swarm you can't see is a swarm you don't trust: **Ringside**, a local web page every run opens automatically, showing every live swarm on your machine — who's running it, what each worker is doing, elapsed time, token burn — in real time, plus a versioned library of what past runs produced.
 
@@ -316,7 +316,9 @@ Read it with:
 ./ringer.py models          # per-(model, task_type) scoreboard across the local log
 ```
 
-The scoreboard reports, per model and task_type: tasks, attempts, `blocked`, `block_rate`, `pass_rate`, `first_try_pass_rate`, median duration and token count, and `last_seen`. `block_rate` is blocked tasks divided by all tasks, so frequent verifier objections remain visible. BLOCKED tasks count in `tasks` but are excluded from the denominators of `pass_rate` and `first_try_pass_rate`; the latter is the share of scored tasks that passed on attempt 1 without a retry. `pass_rate` is the rescued rate after Ringer's single retry, so the gap between the two is the cost of the retry lane. Slice the log with `--log` (a different JSONL), `--task-type`, `--model`, `--engine`, `--since`, or `--json` for piping elsewhere.
+The scoreboard reports, per model and task_type: tasks, attempts, `blocked`, `check_timeouts`, `block_rate`, `pass_rate`, `first_try_pass_rate`, median duration and token count, and `last_seen`. `block_rate` is blocked tasks divided by all tasks, so frequent verifier objections remain visible. BLOCKED and CHECK_TIMEOUT tasks count in `tasks` but are excluded from the denominators of `pass_rate` and `first_try_pass_rate`, and from tier/proven evidence; the latter rate is the share of scored tasks that passed on attempt 1 without a retry. `pass_rate` is the rescued rate after Ringer's single retry, so the gap between the two is the cost of the retry lane. Slice the log with `--log` (a different JSONL), `--task-type`, `--model`, `--engine`, `--since`, or `--json` for piping elsewhere.
+
+To repair historical check timeouts that were recorded as TIMEOUT, preview all configured stores with `./ringer.py reclassify-check-timeouts`. Re-run with `--apply` to update JSONL, Postgres, and the local read-model DB; `--log`, `--db`, `--no-postgres`, and `--no-db` control the sources. The default is a read-only dry run, and repeated applies are safe.
 
 History from before the `model` / `task_type` / `retry` columns existed can be seeded in one pass:
 
